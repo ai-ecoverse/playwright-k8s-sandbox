@@ -19,11 +19,14 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/carlossg/playwright-k8s-sandbox/internal/backend"
 	"github.com/carlossg/playwright-k8s-sandbox/internal/identify"
+	"github.com/carlossg/playwright-k8s-sandbox/internal/metrics"
 	"github.com/carlossg/playwright-k8s-sandbox/internal/session"
 )
 
@@ -33,15 +36,17 @@ type Handler struct {
 	GetCtx    func(*http.Request) (context.Context, context.CancelFunc)
 	Log       *slog.Logger
 	Backend   string // "sandboxclaim" or "substrate"; controls actor-header injection
+	Metrics   *metrics.Metrics
 	httpProxy *httputil.ReverseProxy
 }
 
-func New(sessions *session.Manager, idx *identify.Index, backendKind string, log *slog.Logger) *Handler {
+func New(sessions *session.Manager, idx *identify.Index, backendKind string, log *slog.Logger, m *metrics.Metrics) *Handler {
 	h := &Handler{
 		Sessions: sessions,
 		Identify: idx,
 		Log:      log,
 		Backend:  backendKind,
+		Metrics:  m,
 	}
 	h.httpProxy = &httputil.ReverseProxy{
 		Director:      func(*http.Request) {}, // we rewrite in ServeHTTP before calling
@@ -60,6 +65,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	id, ok := h.Identify.Lookup(clientIP)
 	if !ok {
+		h.Metrics.UnknownClient()
 		h.Log.Warn("unknown client", "ip", clientIP, "path", r.URL.Path)
 		http.Error(w, fmt.Sprintf("client pod %s not labelled with playwright-id", clientIP), http.StatusForbidden)
 		return
@@ -94,8 +100,33 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request, sess *sessi
 	r2.URL.Host = target.Host
 	r2.Host = substrateHostOrDefault(h.Backend, sess.ID, target.Host)
 	r2.RequestURI = ""
-	h.httpProxy.ServeHTTP(w, r2)
+	sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	start := time.Now()
+	h.httpProxy.ServeHTTP(sr, r2)
+	h.Metrics.RecordRequest("http", strconv.Itoa(sr.status), time.Since(start).Seconds())
 	sess.MarkActive()
+}
+
+// statusRecorder captures the response status code the ReverseProxy writes so
+// it can be used as a metric label.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.status = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session.Session) {
@@ -110,6 +141,7 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	backendConn, err := dialer.DialContext(r.Context(), "tcp", sess.Endpoint.Addr())
 	if err != nil {
+		h.Metrics.BackendDialFailure()
 		http.Error(w, fmt.Sprintf("backend dial failed: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -136,23 +168,37 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 	defer clientConn.Close()
 
 	sess.ConnOpened()
-	defer sess.ConnClosed()
+	h.Metrics.ConnOpened()
+	h.Metrics.CountRequest("ws", strconv.Itoa(http.StatusSwitchingProtocols))
+	start := time.Now()
+	var c2b, b2c int64
+	defer func() {
+		sess.ConnClosed()
+		h.Metrics.ConnClosed("ws", time.Since(start).Seconds())
+		h.Metrics.AddBytes(metrics.DirClientToBackend, atomic.LoadInt64(&c2b))
+		h.Metrics.AddBytes(metrics.DirBackendToClient, atomic.LoadInt64(&b2c))
+	}()
 
 	// Pump bytes both directions until either side closes.
 	errc := make(chan error, 2)
 	go func() {
 		// Drain anything already buffered in the bufio.Reader, then stream.
 		if brw != nil && brw.Reader.Buffered() > 0 {
-			if _, err := io.CopyN(backendConn, brw.Reader, int64(brw.Reader.Buffered())); err != nil {
+			if n, err := io.CopyN(backendConn, brw.Reader, int64(brw.Reader.Buffered())); err != nil {
+				atomic.AddInt64(&c2b, n)
 				errc <- err
 				return
+			} else {
+				atomic.AddInt64(&c2b, n)
 			}
 		}
-		_, err := io.Copy(backendConn, clientConn)
+		n, err := io.Copy(backendConn, clientConn)
+		atomic.AddInt64(&c2b, n)
 		errc <- err
 	}()
 	go func() {
-		_, err := io.Copy(clientConn, backendConn)
+		n, err := io.Copy(clientConn, backendConn)
+		atomic.AddInt64(&b2c, n)
 		errc <- err
 	}()
 	<-errc
@@ -162,6 +208,7 @@ func (h *Handler) proxyError(w http.ResponseWriter, r *http.Request, err error) 
 	if errors.Is(err, context.Canceled) {
 		return
 	}
+	h.Metrics.ProxyError("upstream")
 	h.Log.Warn("upstream error", "path", r.URL.Path, "err", err)
 	http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 }

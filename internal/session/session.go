@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/carlossg/playwright-k8s-sandbox/internal/backend"
+	"github.com/carlossg/playwright-k8s-sandbox/internal/metrics"
 )
 
 type Session struct {
@@ -27,9 +28,9 @@ type Session struct {
 	err   error // populated iff ready is closed and Ensure failed
 }
 
-func (s *Session) MarkActive()  { s.lastActive.Store(time.Now().UnixNano()) }
-func (s *Session) ConnOpened()  { s.activeConn.Add(1); s.MarkActive() }
-func (s *Session) ConnClosed()  { s.activeConn.Add(-1); s.MarkActive() }
+func (s *Session) MarkActive()        { s.lastActive.Store(time.Now().UnixNano()) }
+func (s *Session) ConnOpened()        { s.activeConn.Add(1); s.MarkActive() }
+func (s *Session) ConnClosed()        { s.activeConn.Add(-1); s.MarkActive() }
 func (s *Session) ActiveConns() int32 { return s.activeConn.Load() }
 func (s *Session) LastActive() time.Time {
 	return time.Unix(0, s.lastActive.Load())
@@ -37,22 +38,35 @@ func (s *Session) LastActive() time.Time {
 
 type Manager struct {
 	backend       backend.Backend
+	backendKind   string
 	ensureTimeout time.Duration
 	idleTTL       time.Duration
 	log           *slog.Logger
+	metrics       *metrics.Metrics
 
 	mu       sync.Mutex
 	sessions map[string]*Session
 }
 
-func New(b backend.Backend, ensureTimeout, idleTTL time.Duration, log *slog.Logger) *Manager {
-	return &Manager{
+func New(b backend.Backend, backendKind string, ensureTimeout, idleTTL time.Duration, log *slog.Logger, m *metrics.Metrics) *Manager {
+	mgr := &Manager{
 		backend:       b,
+		backendKind:   backendKind,
 		ensureTimeout: ensureTimeout,
 		idleTTL:       idleTTL,
 		log:           log,
+		metrics:       m,
 		sessions:      map[string]*Session{},
 	}
+	m.RegisterSessionsActive(mgr.activeCount)
+	return mgr
+}
+
+// activeCount is the scrape-time value for the sessions_active gauge.
+func (m *Manager) activeCount() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return float64(len(m.sessions))
 }
 
 // Reconcile populates the session map from existing backend resources on startup.
@@ -113,12 +127,19 @@ func (m *Manager) Get(ctx context.Context, playwrightID string) (*Session, error
 func (m *Manager) resolve(ctx context.Context, sess *Session) {
 	ctx, cancel := context.WithTimeout(ctx, m.ensureTimeout)
 	defer cancel()
+	start := time.Now()
 	ep, err := m.backend.Ensure(ctx, sess.ID)
+	elapsed := time.Since(start).Seconds()
 	if err != nil {
 		sess.err = err
+		m.metrics.ObserveEnsure(m.backendKind, metrics.OutcomeFailure, elapsed)
+		m.metrics.EnsureFailed(m.backendKind)
+		m.metrics.SessionCreated(m.backendKind, metrics.OutcomeFailure)
 		m.log.Error("ensure failed", "id", sess.ID, "err", err)
 	} else {
 		sess.Endpoint = ep
+		m.metrics.ObserveEnsure(m.backendKind, metrics.OutcomeSuccess, elapsed)
+		m.metrics.SessionCreated(m.backendKind, metrics.OutcomeSuccess)
 		m.log.Info("session ready", "id", sess.ID, "endpoint", ep.Addr())
 	}
 	close(sess.ready)
@@ -163,9 +184,13 @@ func (m *Manager) reapOnce(ctx context.Context) {
 
 	for _, sess := range victims {
 		if err := m.backend.Delete(ctx, sess.ID); err != nil {
+			m.metrics.BackendDeleteFailure()
 			m.log.Error("reap delete failed", "id", sess.ID, "err", err)
 			continue
 		}
+		m.metrics.SessionReaped("idle")
+		m.metrics.ObserveIdle(time.Since(sess.LastActive()).Seconds())
+		m.metrics.ObserveLifetime(m.backendKind, time.Since(sess.created).Seconds())
 		m.log.Info("reaped idle session", "id", sess.ID, "idle_for", time.Since(sess.LastActive()).Round(time.Second))
 	}
 }

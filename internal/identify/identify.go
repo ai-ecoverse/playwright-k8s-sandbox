@@ -17,6 +17,8 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/carlossg/playwright-k8s-sandbox/internal/metrics"
 )
 
 const diagnosticTTL = 10 * time.Minute
@@ -39,19 +41,31 @@ type Index struct {
 	// loop. Entries expire so unique unresolved IPs are not retained forever.
 	diagnosedMu  sync.Mutex
 	diagnosedIPs map[string]time.Time
+
+	metrics *metrics.Metrics
 }
 
 // New creates an Index. `client` and `namespace` are stored eagerly so the
 // API-fallback path on Lookup works even before Run's informer cache has
 // synced (e.g., the very first request after proxy startup).
-func New(labelKey string, client kubernetes.Interface, namespace string) *Index {
-	return &Index{
+func New(labelKey string, client kubernetes.Interface, namespace string, m *metrics.Metrics) *Index {
+	i := &Index{
 		labelKey:     labelKey,
 		byPodIP:      map[string]string{},
 		client:       client,
 		namespace:    namespace,
 		diagnosedIPs: map[string]time.Time{},
+		metrics:      m,
 	}
+	m.RegisterRegisteredPods(i.registeredCount)
+	return i
+}
+
+// registeredCount is the scrape-time value for the registered_pods gauge.
+func (i *Index) registeredCount() float64 {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return float64(len(i.byPodIP))
 }
 
 // Lookup returns the playwright-id for a given pod IP. Returns ("", false) if unknown.
@@ -65,9 +79,11 @@ func New(labelKey string, client kubernetes.Interface, namespace string) *Index 
 // new pod pays the cost — the resolved id is cached.
 func (i *Index) Lookup(podIP string) (string, bool) {
 	if id, ok := i.lookupCache(podIP); ok {
+		i.metrics.Lookup(metrics.LookupCacheHit)
 		return id, true
 	}
 	if i.client == nil || i.namespace == "" {
+		i.metrics.Lookup(metrics.LookupMiss)
 		return "", false
 	}
 	// Short backoff loop: 100ms × 100 = 10s. Each poll re-checks the cache
@@ -76,16 +92,19 @@ func (i *Index) Lookup(podIP string) (string, bool) {
 	// 10s leaves headroom without blocking the WS upgrade indefinitely.
 	for n := 0; n < 100; n++ {
 		if id, ok := i.lookupCache(podIP); ok {
+			i.metrics.Lookup(metrics.LookupCacheHit)
 			return id, true
 		}
 		if id, ok := i.lookupViaAPI(podIP); ok {
 			i.mu.Lock()
 			i.byPodIP[podIP] = id
 			i.mu.Unlock()
+			i.metrics.Lookup(metrics.LookupAPIFallback)
 			return id, true
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	i.metrics.Lookup(metrics.LookupMiss)
 	return "", false
 }
 
