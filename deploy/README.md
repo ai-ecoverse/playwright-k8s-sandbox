@@ -153,10 +153,10 @@ The proxy exposes metrics and health endpoints on the mgmt port 9090:
 
 ### Scraping
 
-Two options, both included in `proxy.yaml`:
+Two options:
 
-1. **Pod annotations** (plain Prometheus with `kubernetes-pods` relabeling). The
-   Deployment pod template already carries:
+1. **Pod annotations** (plain Prometheus with `kubernetes-pods` relabeling),
+   defined in `proxy.yaml`. The Deployment pod template already carries:
 
    ```yaml
    annotations:

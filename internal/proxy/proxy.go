@@ -10,6 +10,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -160,6 +162,36 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 		return
 	}
 
+	// Read the backend's response to the upgrade so we can record its real
+	// status and only tunnel when the upgrade was actually accepted. Bytes the
+	// reader buffers past the response headers are carried into the tunnel via
+	// backendBr below, so nothing is lost.
+	backendBr := bufio.NewReader(backendConn)
+	resp, err := http.ReadResponse(backendBr, outReq)
+	if err != nil {
+		h.Metrics.ProxyError("ws_upstream")
+		h.Log.Warn("backend upgrade response failed", "id", sess.ID, "err", err)
+		http.Error(w, fmt.Sprintf("backend response failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	h.Metrics.CountRequest("ws", strconv.Itoa(resp.StatusCode))
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		// Upgrade rejected. Forward the backend's response to the client verbatim
+		// and stop — this is not a live connection, so no ConnOpened / active
+		// connection accounting.
+		defer resp.Body.Close()
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// Upgrade accepted: hijack the client connection and splice the two.
 	clientConn, brw, err := hj.Hijack()
 	if err != nil {
 		h.Log.Error("hijack failed", "err", err)
@@ -167,9 +199,20 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 	}
 	defer clientConn.Close()
 
+	// Replay the 101 handshake to the client. We serialize the status line and
+	// headers by hand rather than resp.Write, which would try to copy resp.Body
+	// (the tunnel) and deadlock.
+	var handshake bytes.Buffer
+	fmt.Fprintf(&handshake, "%s %s\r\n", resp.Proto, resp.Status)
+	resp.Header.Write(&handshake)
+	handshake.WriteString("\r\n")
+	if _, err := clientConn.Write(handshake.Bytes()); err != nil {
+		h.Log.Error("write upgrade response failed", "err", err)
+		return
+	}
+
 	sess.ConnOpened()
 	h.Metrics.ConnOpened()
-	h.Metrics.CountRequest("ws", strconv.Itoa(http.StatusSwitchingProtocols))
 	start := time.Now()
 	var c2b, b2c int64
 	defer func() {
@@ -197,10 +240,19 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 		errc <- err
 	}()
 	go func() {
-		n, err := io.Copy(clientConn, backendConn)
+		// Read from backendBr, not backendConn, so bytes buffered past the
+		// response headers are forwarded.
+		n, err := io.Copy(clientConn, backendBr)
 		atomic.AddInt64(&b2c, n)
 		errc <- err
 	}()
+	// Wait for one direction to end, then close both connections so the other
+	// io.Copy unblocks, and drain its result. This guarantees both byte totals
+	// are final before the deferred handler reads them (correct accounting for
+	// half-closed connections).
+	<-errc
+	clientConn.Close()
+	backendConn.Close()
 	<-errc
 }
 

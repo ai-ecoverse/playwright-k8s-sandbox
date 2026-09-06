@@ -20,7 +20,7 @@ spec:
         # The proxy is not being scraped — either down, crash-looping, or the
         # mgmt listener is wedged. This gates on the target being unreachable.
         - alert: PlaywrightProxyDown
-          expr: up{job="playwright-proxy"} == 0
+          expr: up{job="playwright-proxy"} == 0 or absent(up{job="playwright-proxy"})
           for: 5m
           labels:
             severity: critical
@@ -54,7 +54,7 @@ spec:
             severity: warning
           annotations:
             summary: "Over 25% of session creations are failing"
-            description: "{{ printf \"%.0f\" ($value | mul 100) }}% of playwright-proxy session creations failed over 10m."
+            description: "{{ $value | humanizePercentage }} of playwright-proxy session creations failed over 10m."
 
         # Cold starts are slow. p95 provisioning latency above the ensure
         # timeout headroom means users see long waits / timeouts.
@@ -105,7 +105,7 @@ spec:
             severity: warning
           annotations:
             summary: "Over 5% of proxied requests are 5xx"
-            description: "{{ printf \"%.0f\" ($value | mul 100) }}% of playwright-proxy requests returned 5xx over 10m."
+            description: "{{ $value | humanizePercentage }} of playwright-proxy requests returned 5xx over 10m."
 
     - name: playwright-proxy.routing
       rules:
@@ -133,7 +133,7 @@ spec:
             severity: warning
           annotations:
             summary: "Over 10% of identify lookups miss"
-            description: "{{ printf \"%.0f\" ($value | mul 100) }}% of pod-IP lookups failed to resolve a playwright-id over 10m."
+            description: "{{ $value | humanizePercentage }} of pod-IP lookups failed to resolve a playwright-id over 10m."
 
     - name: playwright-proxy.leaks
       rules:
