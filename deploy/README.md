@@ -217,6 +217,24 @@ backend dial failures, upstream & 5xx errors, unknown-client rejections, high
 lookup-miss ratio, and sandbox-reap (leak) failures. Tune the thresholds to your
 traffic.
 
+### Grafana dashboard
+
+`grafana-dashboard.json` is an importable dashboard (Dashboards → New → Import →
+Upload JSON) covering the full metric set:
+
+- **Overview** — sessions running, active connections, creation & ensure-failure
+  rates, registered client pods, and proxy up/down.
+- **Sandbox lifecycle** — creation/reap rates, provisioning (Ensure) latency
+  p50/p95/p99, ensure failures, and session lifetime / idle-at-reap.
+- **Usage** — active connections, connection-duration p95, usage time
+  (connection-seconds per minute), request rate by protocol & code, bytes
+  transferred, and request latency p95.
+- **Routing & errors** — identify lookups by result, unknown-client rejections,
+  proxy/backend/reap errors, and the HTTP 5xx ratio.
+
+It uses a `datasource` template variable (pick your Prometheus source on import)
+and a `backend` variable to filter by backend. No manual UID editing needed.
+
 ## Troubleshooting
 
 ### Proxy pod not starting
