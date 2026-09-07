@@ -1,0 +1,149 @@
+# Prometheus Operator alerting rules for the playwright proxy.
+# Requires the Prometheus Operator CRDs (monitoring.coreos.com/v1).
+#
+# Substitute NAMESPACE and, if needed, adjust the `release` label to match your
+# Prometheus Operator's ruleSelector. Thresholds are starting points — tune to
+# your traffic. Expressions assume the `job` label Prometheus assigns from the
+# ServiceMonitor above ("playwright-proxy"); adjust the selector if yours differs.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: playwright-proxy
+  namespace: NAMESPACE
+  labels:
+    app.kubernetes.io/name: playwright-proxy
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: playwright-proxy.availability
+      rules:
+        # The proxy is not being scraped — either down, crash-looping, or the
+        # mgmt listener is wedged. This gates on the target being unreachable.
+        - alert: PlaywrightProxyDown
+          expr: up{job="playwright-proxy"} == 0 or absent(up{job="playwright-proxy"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "playwright-proxy target {{ $labels.instance }} is down"
+            description: "Prometheus cannot scrape playwright-proxy for 5m. Agents cannot reach Playwright sandboxes."
+
+    - name: playwright-proxy.provisioning
+      rules:
+        # Sandbox provisioning is failing. Any sustained failure rate is worth a
+        # page: new sessions cannot get a browser.
+        - alert: PlaywrightEnsureFailures
+          expr: sum by (backend) (rate(playwright_session_ensure_failures_total[5m])) > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sandbox provisioning failing for backend {{ $labels.backend }}"
+            description: "playwright-proxy Ensure has been failing for 10m ({{ printf \"%.2f\" $value }}/s). Sessions cannot acquire a sandbox."
+
+        # A large share of session creations end in failure (catches the case
+        # where absolute rate is low but nearly everything fails).
+        - alert: PlaywrightEnsureFailureRatioHigh
+          expr: |
+            sum(rate(playwright_sessions_created_total{outcome="failure"}[10m]))
+              /
+            clamp_min(sum(rate(playwright_sessions_created_total[10m])), 1e-9)
+              > 0.25
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Over 25% of session creations are failing"
+            description: "{{ $value | humanizePercentage }} of playwright-proxy session creations failed over 10m."
+
+        # Cold starts are slow. p95 provisioning latency above the ensure
+        # timeout headroom means users see long waits / timeouts.
+        - alert: PlaywrightHighEnsureLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le, backend) (rate(playwright_session_ensure_duration_seconds_bucket[10m]))
+            ) > 30
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "p95 sandbox provisioning latency > 30s (backend {{ $labels.backend }})"
+            description: "p95 Ensure latency is {{ printf \"%.1f\" $value }}s over 10m; approaching ENSURE_TIMEOUT."
+
+    - name: playwright-proxy.dataplane
+      rules:
+        # WebSocket dial to the sandbox is failing after a session resolved —
+        # points at sandbox pod networking / readiness problems.
+        - alert: PlaywrightBackendDialFailures
+          expr: rate(playwright_backend_dial_failures_total[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "playwright-proxy failing to dial sandbox backends"
+            description: "Backend dial failures at {{ printf \"%.2f\" $value }}/s for 10m. Sessions resolve but the WS upgrade cannot connect."
+
+        # Upstream/proxy-layer errors (bad gateway, upstream resets).
+        - alert: PlaywrightUpstreamErrors
+          expr: sum by (kind) (rate(playwright_proxy_errors_total[5m])) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated playwright-proxy upstream errors ({{ $labels.kind }})"
+            description: "Proxy errors at {{ printf \"%.2f\" $value }}/s for 10m."
+
+        # 5xx responses on the HTTP/MCP path.
+        - alert: PlaywrightHTTP5xxRatioHigh
+          expr: |
+            sum(rate(playwright_requests_total{code=~"5.."}[5m]))
+              /
+            clamp_min(sum(rate(playwright_requests_total[5m])), 1e-9)
+              > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Over 5% of proxied requests are 5xx"
+            description: "{{ $value | humanizePercentage }} of playwright-proxy requests returned 5xx over 10m."
+
+    - name: playwright-proxy.routing
+      rules:
+        # Clients being rejected as unknown — usually pods missing/empty
+        # playwright-id label, or informer/RBAC problems. A steady stream means
+        # a whole cohort of agents cannot be routed.
+        - alert: PlaywrightUnknownClients
+          expr: rate(playwright_unknown_client_total[5m]) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "playwright-proxy rejecting unlabelled clients"
+            description: "Unknown-client rejections at {{ printf \"%.2f\" $value }}/s for 10m (403s). Check the playwright-id label on client pods and proxy RBAC."
+
+        # Lookups repeatedly falling all the way through to miss.
+        - alert: PlaywrightLookupMissRatioHigh
+          expr: |
+            sum(rate(playwright_lookups_total{result="miss"}[5m]))
+              /
+            clamp_min(sum(rate(playwright_lookups_total[5m])), 1e-9)
+              > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Over 10% of identify lookups miss"
+            description: "{{ $value | humanizePercentage }} of pod-IP lookups failed to resolve a playwright-id over 10m."
+
+    - name: playwright-proxy.leaks
+      rules:
+        # Reaper cannot delete sandboxes — idle sandboxes leak and consume
+        # cluster capacity indefinitely.
+        - alert: PlaywrightSandboxLeak
+          expr: rate(playwright_backend_delete_failures_total[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "playwright-proxy cannot reap idle sandboxes"
+            description: "Backend delete failures for 15m ({{ printf \"%.2f\" $value }}/s). Idle sandboxes are leaking — check backend RBAC and CR finalizers."

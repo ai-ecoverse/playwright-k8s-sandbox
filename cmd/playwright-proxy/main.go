@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -17,8 +18,16 @@ import (
 	"github.com/carlossg/playwright-k8s-sandbox/internal/backend"
 	"github.com/carlossg/playwright-k8s-sandbox/internal/config"
 	"github.com/carlossg/playwright-k8s-sandbox/internal/identify"
+	"github.com/carlossg/playwright-k8s-sandbox/internal/metrics"
 	"github.com/carlossg/playwright-k8s-sandbox/internal/proxy"
 	"github.com/carlossg/playwright-k8s-sandbox/internal/session"
+)
+
+// version and commit are set at build time via -ldflags and surfaced in the
+// playwright_build_info metric.
+var (
+	version = "dev"
+	commit  = "none"
 )
 
 func main() {
@@ -77,7 +86,9 @@ func run(log *slog.Logger) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	idx := identify.New(cfg.LabelKey, clientset, cfg.Namespace)
+	mx := metrics.New(cfg.Backend, version, commit)
+
+	idx := identify.New(cfg.LabelKey, clientset, cfg.Namespace, mx)
 	go func() {
 		if err := idx.Run(ctx); err != nil && ctx.Err() == nil {
 			log.Error("pod informer stopped", "err", err)
@@ -85,7 +96,7 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
-	sm := session.New(bk, cfg.EnsureTimeout, cfg.IdleTTL, log)
+	sm := session.New(bk, cfg.Backend, cfg.EnsureTimeout, cfg.IdleTTL, log, mx)
 
 	// Best-effort reconcile on startup; failures here aren't fatal.
 	rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
@@ -96,7 +107,7 @@ func run(log *slog.Logger) error {
 
 	go sm.ReapLoop(ctx, cfg.IdleCheckInterval)
 
-	dataHandler := proxy.New(sm, idx, cfg.Backend, log)
+	dataHandler := proxy.New(sm, idx, cfg.Backend, log, mx)
 	dataSrv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: dataHandler,
@@ -104,6 +115,7 @@ func run(log *slog.Logger) error {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(mx.Registry(), promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	// /readyz returns 200 only once the pod informer has finished its initial
 	// LIST. Until then, kube-proxy must keep this pod out of the Service

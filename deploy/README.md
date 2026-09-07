@@ -145,19 +145,95 @@ docker push ghcr.io/carlossg/playwright-k8s-sandbox:latest
 
 ## Monitoring
 
-The proxy exposes metrics and health endpoints on port 9090:
+The proxy exposes metrics and health endpoints on the mgmt port 9090:
 
+- `/metrics` - Prometheus metrics (see below)
 - `/healthz` - Liveness check
-- `/readyz` - Readiness check
+- `/readyz`  - Readiness check
 
-Add Prometheus scraping if needed:
+### Scraping
 
-```yaml
-annotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "9090"
-  prometheus.io/path: "/metrics"
+Two options:
+
+1. **Pod annotations** (plain Prometheus with `kubernetes-pods` relabeling),
+   defined in `proxy.yaml`. The Deployment pod template already carries:
+
+   ```yaml
+   annotations:
+     prometheus.io/scrape: "true"
+     prometheus.io/port: "9090"
+     prometheus.io/path: "/metrics"
+   ```
+
+2. **Prometheus Operator** — apply `servicemonitor.yaml` (targets the `mgmt`
+   Service port) and `prometheusrule.yaml` (alerts). Adjust the `release` label
+   to match your operator's selector.
+
+### Exported metrics
+
+All series are prefixed `playwright_`. Standard `go_*` / `process_*` runtime
+metrics are also exported.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `playwright_sessions_created_total` | counter | `backend`, `outcome` | Sessions created (when / how many). |
+| `playwright_sessions_active` | gauge | — | Sessions currently running. |
+| `playwright_sessions_reaped_total` | counter | `reason` | Sessions torn down. |
+| `playwright_session_ensure_duration_seconds` | histogram | `backend`, `outcome` | Provisioning / cold-start time. |
+| `playwright_session_ensure_failures_total` | counter | `backend` | Provisioning failures. |
+| `playwright_session_lifetime_seconds` | histogram | `backend` | Creation → teardown. |
+| `playwright_session_idle_seconds` | histogram | — | Idle time at reap. |
+| `playwright_active_connections` | gauge | — | Open proxied connections. |
+| `playwright_connection_duration_seconds` | histogram | `protocol` | Connection duration = actual usage time. |
+| `playwright_requests_total` | counter | `protocol`, `code` | Proxied requests. |
+| `playwright_request_duration_seconds` | histogram | `protocol` | HTTP/MCP request latency. |
+| `playwright_bytes_transferred_total` | counter | `direction` | Bytes proxied (usage volume). |
+| `playwright_lookups_total` | counter | `result` | IP→id lookups (cache_hit / api_fallback / miss). |
+| `playwright_unknown_client_total` | counter | — | Rejected unlabelled clients (403s). |
+| `playwright_registered_pods` | gauge | — | Client pods in the identify cache. |
+| `playwright_backend_dial_failures_total` | counter | — | WS dial failures to sandbox. |
+| `playwright_proxy_errors_total` | counter | `kind` | Proxy-layer errors. |
+| `playwright_backend_delete_failures_total` | counter | — | Reap delete failures (sandbox leaks). |
+| `playwright_build_info` | gauge | `version`, `commit`, `backend` | Build metadata (always 1). |
+
+Useful queries:
+
+```promql
+# Sessions created per hour by outcome
+sum by (outcome) (increase(playwright_sessions_created_total[1h]))
+
+# Actual usage time (connection-seconds) over the last hour
+sum(increase(playwright_connection_duration_seconds_sum[1h]))
+
+# p95 cold-start latency
+histogram_quantile(0.95, sum by (le) (rate(playwright_session_ensure_duration_seconds_bucket[10m])))
 ```
+
+### Alerts
+
+`prometheusrule.yaml` ships starting-point alerts for the error conditions worth
+watching: proxy down, provisioning failures / high ratio, slow cold starts,
+backend dial failures, upstream & 5xx errors, unknown-client rejections, high
+lookup-miss ratio, and sandbox-reap (leak) failures. Tune the thresholds to your
+traffic.
+
+### Grafana dashboard
+
+`grafana-dashboard.json` is an importable dashboard (Dashboards → New → Import →
+Upload JSON) covering the full metric set:
+
+- **Overview** — sessions running, active connections, creation & ensure-failure
+  rates, registered client pods, and proxy up/down.
+- **Sandbox lifecycle** — creation/reap rates, provisioning (Ensure) latency
+  p50/p95/p99, ensure failures, and session lifetime / idle-at-reap.
+- **Usage** — active connections, connection-duration p95, usage time
+  (connection-seconds per minute), request rate by protocol & code, bytes
+  transferred, and request latency p95.
+- **Routing & errors** — identify lookups by result, unknown-client rejections,
+  proxy/backend/reap errors, and the HTTP 5xx ratio.
+
+It uses a `datasource` template variable (pick your Prometheus source on import)
+and a `backend` variable to filter by backend. No manual UID editing needed.
 
 ## Troubleshooting
 

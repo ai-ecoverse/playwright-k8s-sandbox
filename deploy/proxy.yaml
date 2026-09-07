@@ -19,6 +19,13 @@ spec:
       app.kubernetes.io/name: playwright-proxy
   template:
     metadata:
+      annotations:
+        # Enables scraping by a Prometheus configured with the standard
+        # kubernetes-pods annotation relabeling (drop these if you scrape via a
+        # ServiceMonitor / PodMonitor instead — see servicemonitor.yaml).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
       labels:
         app.kubernetes.io/name: playwright-proxy
         # Belt-and-suspenders: this label matches the default ingress selector
@@ -116,3 +123,8 @@ spec:
     - name: data
       port: 9000
       targetPort: data
+    # mgmt exposes /metrics, /healthz, /readyz. Required for a ServiceMonitor to
+    # target the Service by port name.
+    - name: mgmt
+      port: 9090
+      targetPort: mgmt
