@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.25 AS build
+FROM golang:1.27 AS build
 WORKDIR /src
 
 # Download dependencies first for better layer caching
