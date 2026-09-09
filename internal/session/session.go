@@ -36,6 +36,11 @@ func (s *Session) LastActive() time.Time {
 	return time.Unix(0, s.lastActive.Load())
 }
 
+// refreshCooldown bounds how often Refresh will re-Ensure the same id. Without
+// it, a replacement endpoint that is itself unreachable would trigger one
+// backend.Ensure call per failed proxied request.
+const refreshCooldown = 2 * time.Second
+
 type Manager struct {
 	backend       backend.Backend
 	backendKind   string
@@ -44,8 +49,9 @@ type Manager struct {
 	log           *slog.Logger
 	metrics       *metrics.Metrics
 
-	mu       sync.Mutex
-	sessions map[string]*Session
+	mu          sync.Mutex
+	sessions    map[string]*Session
+	lastRefresh map[string]time.Time
 }
 
 func New(b backend.Backend, backendKind string, ensureTimeout, idleTTL time.Duration, log *slog.Logger, m *metrics.Metrics) *Manager {
@@ -57,6 +63,7 @@ func New(b backend.Backend, backendKind string, ensureTimeout, idleTTL time.Dura
 		log:           log,
 		metrics:       m,
 		sessions:      map[string]*Session{},
+		lastRefresh:   map[string]time.Time{},
 	}
 	m.RegisterSessionsActive(mgr.activeCount)
 	return mgr
@@ -179,6 +186,7 @@ func (m *Manager) reapOnce(ctx context.Context) {
 		}
 		victims = append(victims, sess)
 		delete(m.sessions, id)
+		delete(m.lastRefresh, id)
 	}
 	m.mu.Unlock()
 
@@ -193,6 +201,46 @@ func (m *Manager) reapOnce(ctx context.Context) {
 		m.metrics.ObserveLifetime(m.backendKind, time.Since(sess.created).Seconds())
 		m.log.Info("reaped idle session", "id", sess.ID, "idle_for", time.Since(sess.LastActive()).Round(time.Second))
 	}
+}
+
+// Refresh drops a session whose cached Endpoint has proven unreachable (a live
+// dial/round-trip failed) and re-resolves it via backend.Ensure. This recovers
+// from the sandbox pod being recreated with a new IP behind an existing,
+// otherwise-healthy session — e.g. a Karpenter eviction — without waiting for
+// the idle reaper, which never fires for a session that keeps getting hit.
+//
+// Safe to call concurrently for the same stale session: only the caller that
+// still finds `stale` in the map performs the drop, so concurrent callers
+// racing on the same dead endpoint collapse onto a single re-Ensure via Get's
+// existing singleflight-by-ready-channel.
+//
+// Within refreshCooldown of the last refresh for an id, Refresh is a no-op
+// that returns whatever session is currently cached (which may still be the
+// same unreachable endpoint) instead of calling backend.Ensure again — this
+// bounds Ensure load when the replacement endpoint is itself unreachable.
+func (m *Manager) Refresh(ctx context.Context, stale *Session) (*Session, error) {
+	m.mu.Lock()
+	if last, ok := m.lastRefresh[stale.ID]; ok && time.Since(last) < refreshCooldown {
+		cur := m.sessions[stale.ID]
+		m.mu.Unlock()
+		if cur != nil {
+			return cur, nil
+		}
+		return m.Get(ctx, stale.ID)
+	}
+	if cur, ok := m.sessions[stale.ID]; ok && cur == stale {
+		delete(m.sessions, stale.ID)
+	}
+	m.lastRefresh[stale.ID] = time.Now()
+	m.mu.Unlock()
+
+	sess, err := m.Get(ctx, stale.ID)
+	if err != nil {
+		m.metrics.SessionRefreshed(m.backendKind, metrics.OutcomeFailure)
+		return nil, err
+	}
+	m.metrics.SessionRefreshed(m.backendKind, metrics.OutcomeSuccess)
+	return sess, nil
 }
 
 // ErrNoSession is returned by Get when the backend is misconfigured for this id.

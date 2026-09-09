@@ -37,8 +37,9 @@ type Metrics struct {
 	reg *prometheus.Registry
 
 	// Session lifecycle.
-	sessionsCreated *prometheus.CounterVec   // labels: backend, outcome
-	sessionsReaped  *prometheus.CounterVec   // labels: reason
+	sessionsCreated   *prometheus.CounterVec   // labels: backend, outcome
+	sessionsRefreshed *prometheus.CounterVec   // labels: backend, outcome
+	sessionsReaped    *prometheus.CounterVec   // labels: reason
 	ensureDuration  *prometheus.HistogramVec // labels: backend, outcome
 	ensureFailures  *prometheus.CounterVec   // labels: backend
 	sessionLifetime *prometheus.HistogramVec // labels: backend
@@ -82,6 +83,10 @@ func New(backend, version, commit string) *Metrics {
 		sessionsCreated: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "playwright_sessions_created_total",
 			Help: "Sandbox sessions created, by backend and outcome.",
+		}, []string{"backend", "outcome"}),
+		sessionsRefreshed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "playwright_sessions_refreshed_total",
+			Help: "Sessions re-resolved after a cached endpoint proved unreachable (e.g. sandbox pod recreated with a new IP), by backend and outcome.",
 		}, []string{"backend", "outcome"}),
 		sessionsReaped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "playwright_sessions_reaped_total",
@@ -151,7 +156,7 @@ func New(backend, version, commit string) *Metrics {
 	}
 
 	reg.MustRegister(
-		m.sessionsCreated, m.sessionsReaped, m.ensureDuration, m.ensureFailures,
+		m.sessionsCreated, m.sessionsRefreshed, m.sessionsReaped, m.ensureDuration, m.ensureFailures,
 		m.sessionLifetime, m.sessionIdle, m.activeConns, m.connDuration,
 		m.requests, m.requestLatency, m.bytes, m.lookups, m.unknownClients,
 		m.backendDialFailures, m.proxyErrors, m.backendDeleteFailures,
@@ -198,6 +203,13 @@ func (m *Metrics) SessionCreated(backend, outcome string) {
 		return
 	}
 	m.sessionsCreated.WithLabelValues(backend, outcome).Inc()
+}
+
+func (m *Metrics) SessionRefreshed(backend, outcome string) {
+	if m == nil {
+		return
+	}
+	m.sessionsRefreshed.WithLabelValues(backend, outcome).Inc()
 }
 
 func (m *Metrics) SessionReaped(reason string) {
