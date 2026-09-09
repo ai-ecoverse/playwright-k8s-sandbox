@@ -54,8 +54,58 @@ func New(sessions *session.Manager, idx *identify.Index, backendKind string, log
 		Director:      func(*http.Request) {}, // we rewrite in ServeHTTP before calling
 		ErrorHandler:  h.proxyError,
 		FlushInterval: -1, // immediate flush for streaming / SSE / MCP
+		Transport: &retryingTransport{
+			inner:       http.DefaultTransport,
+			sessions:    sessions,
+			backendKind: backendKind,
+		},
 	}
 	return h
+}
+
+// sessCtxKey stashes the session a request was proxied for so retryingTransport
+// can re-resolve it without threading extra parameters through
+// httputil.ReverseProxy.
+type sessCtxKey struct{}
+
+// retryingTransport gives the HTTP/MCP path the same one-shot recovery as the
+// WebSocket path (see the dial-failure handling in handleWS): if the round trip
+// fails to connect at all, the cached endpoint is likely stale because the
+// sandbox pod was recreated with a new IP. It re-resolves the session once and
+// replays the request against the fresh endpoint before giving up.
+//
+// RoundTrip only returns an error for transport-level failures (dial/connect,
+// broken connection, timeout); a response that came back with an HTTP error
+// status is not retried here — ordinary app/page-level errors must not trigger
+// failover.
+type retryingTransport struct {
+	inner       http.RoundTripper
+	sessions    *session.Manager
+	backendKind string
+}
+
+func (t *retryingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.inner.RoundTrip(req)
+	if err == nil {
+		return resp, nil
+	}
+	sess, ok := req.Context().Value(sessCtxKey{}).(*session.Session)
+	if !ok || req.GetBody == nil {
+		return resp, err
+	}
+	refreshed, rerr := t.sessions.Refresh(req.Context(), sess)
+	if rerr != nil {
+		return resp, err
+	}
+	body, berr := req.GetBody()
+	if berr != nil {
+		return resp, err
+	}
+	req2 := req.Clone(req.Context())
+	req2.Body = body
+	req2.URL.Host = refreshed.Endpoint.MCPAddr()
+	req2.Host = substrateHostOrDefault(t.backendKind, refreshed.ID, req2.URL.Host)
+	return t.inner.RoundTrip(req2)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +152,25 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request, sess *sessi
 	r2.URL.Host = target.Host
 	r2.Host = substrateHostOrDefault(h.Backend, sess.ID, target.Host)
 	r2.RequestURI = ""
+
+	// Buffer the body and set GetBody so retryingTransport can replay the
+	// request once if the cached endpoint turns out to be stale (see
+	// retryingTransport.RoundTrip). MCP-over-HTTP payloads are small
+	// control-plane calls, so buffering them is cheap.
+	if r2.Body != nil && r2.Body != http.NoBody {
+		buf, readErr := io.ReadAll(r2.Body)
+		r2.Body.Close()
+		if readErr != nil {
+			http.Error(w, fmt.Sprintf("reading request body: %v", readErr), http.StatusBadGateway)
+			return
+		}
+		r2.Body = io.NopCloser(bytes.NewReader(buf))
+		r2.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(buf)), nil
+		}
+	}
+	r2 = r2.WithContext(context.WithValue(r2.Context(), sessCtxKey{}, sess))
+
 	sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	start := time.Now()
 	h.httpProxy.ServeHTTP(sr, r2)
@@ -139,11 +208,23 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 		return
 	}
 
-	// Dial the backend.
+	// Dial the backend. A dial failure against an otherwise-healthy session means
+	// the sandbox pod was most likely recreated with a new IP underneath the
+	// cached endpoint (e.g. a Karpenter eviction) — re-resolve once via the
+	// backend and retry before giving up.
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	backendConn, err := dialer.DialContext(r.Context(), "tcp", sess.Endpoint.Addr())
 	if err != nil {
 		h.Metrics.BackendDialFailure()
+		if refreshed, rerr := h.Sessions.Refresh(r.Context(), sess); rerr == nil {
+			sess = refreshed
+			backendConn, err = dialer.DialContext(r.Context(), "tcp", sess.Endpoint.Addr())
+			if err != nil {
+				h.Metrics.BackendDialFailure()
+			}
+		}
+	}
+	if err != nil {
 		http.Error(w, fmt.Sprintf("backend dial failed: %v", err), http.StatusBadGateway)
 		return
 	}

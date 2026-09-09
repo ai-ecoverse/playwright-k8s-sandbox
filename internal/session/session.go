@@ -195,5 +195,31 @@ func (m *Manager) reapOnce(ctx context.Context) {
 	}
 }
 
+// Refresh drops a session whose cached Endpoint has proven unreachable (a live
+// dial/round-trip failed) and re-resolves it via backend.Ensure. This recovers
+// from the sandbox pod being recreated with a new IP behind an existing,
+// otherwise-healthy session — e.g. a Karpenter eviction — without waiting for
+// the idle reaper, which never fires for a session that keeps getting hit.
+//
+// Safe to call concurrently for the same stale session: only the caller that
+// still finds `stale` in the map performs the drop, so concurrent callers
+// racing on the same dead endpoint collapse onto a single re-Ensure via Get's
+// existing singleflight-by-ready-channel.
+func (m *Manager) Refresh(ctx context.Context, stale *Session) (*Session, error) {
+	m.mu.Lock()
+	if cur, ok := m.sessions[stale.ID]; ok && cur == stale {
+		delete(m.sessions, stale.ID)
+	}
+	m.mu.Unlock()
+
+	sess, err := m.Get(ctx, stale.ID)
+	if err != nil {
+		m.metrics.SessionRefreshed(m.backendKind, metrics.OutcomeFailure)
+		return nil, err
+	}
+	m.metrics.SessionRefreshed(m.backendKind, metrics.OutcomeSuccess)
+	return sess, nil
+}
+
 // ErrNoSession is returned by Get when the backend is misconfigured for this id.
 var ErrNoSession = errors.New("no session")
