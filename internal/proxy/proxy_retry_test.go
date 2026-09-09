@@ -59,12 +59,15 @@ func (b *scriptedBackend) List(ctx context.Context) ([]string, error)  { return 
 // closed, so dialing it fails fast with connection refused.
 func deadEndpoint(t *testing.T) backend.Endpoint {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
 	h, p, _ := net.SplitHostPort(addr)
 	pn, _ := strconv.Atoi(p)
 	return backend.Endpoint{Host: h, Port: pn}
@@ -105,7 +108,10 @@ func TestHandleWSRetriesOnDialFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	resp, err := http.DefaultClient.Do(req)
@@ -160,7 +166,12 @@ func TestHandleHTTPRetriesOnDialFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(`{"hello":"world"}`))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, strings.NewReader(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +223,11 @@ func TestHandleHTTPDoesNotRetryOnAppLevelError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

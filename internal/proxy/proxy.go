@@ -32,6 +32,11 @@ import (
 	"github.com/carlossg/playwright-k8s-sandbox/internal/session"
 )
 
+// maxReplayBodyBytes caps how much of a request body handleHTTP buffers so it
+// can be replayed by retryingTransport after a dial-failure retry. Bodies
+// larger than this are streamed through unbuffered (no retry on failure).
+const maxReplayBodyBytes int64 = 1 << 20 // 1 MiB
+
 type Handler struct {
 	Sessions  *session.Manager
 	Identify  *identify.Index
@@ -70,13 +75,14 @@ type sessCtxKey struct{}
 
 // retryingTransport gives the HTTP/MCP path the same one-shot recovery as the
 // WebSocket path (see the dial-failure handling in handleWS): if the round trip
-// fails to connect at all, the cached endpoint is likely stale because the
+// fails to even connect, the cached endpoint is likely stale because the
 // sandbox pod was recreated with a new IP. It re-resolves the session once and
 // replays the request against the fresh endpoint before giving up.
 //
-// RoundTrip only returns an error for transport-level failures (dial/connect,
-// broken connection, timeout); a response that came back with an HTTP error
-// status is not retried here — ordinary app/page-level errors must not trigger
+// Only a genuine dial/connect failure triggers this (see isDialFailure); a
+// request that reached the backend and then failed (broken connection mid-read,
+// timeout, or an HTTP error status) is not retried here, since the backend may
+// already have acted on it — ordinary app/page-level errors must not trigger
 // failover.
 type retryingTransport struct {
 	inner       http.RoundTripper
@@ -86,26 +92,41 @@ type retryingTransport struct {
 
 func (t *retryingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.inner.RoundTrip(req)
-	if err == nil {
-		return resp, nil
+	if err == nil || !isDialFailure(err) {
+		return resp, err
 	}
 	sess, ok := req.Context().Value(sessCtxKey{}).(*session.Session)
-	if !ok || req.GetBody == nil {
+	if !ok {
+		return resp, err
+	}
+	hasBody := req.Body != nil && req.Body != http.NoBody
+	if hasBody && req.GetBody == nil {
 		return resp, err
 	}
 	refreshed, rerr := t.sessions.Refresh(req.Context(), sess)
 	if rerr != nil {
 		return resp, err
 	}
-	body, berr := req.GetBody()
-	if berr != nil {
-		return resp, err
-	}
 	req2 := req.Clone(req.Context())
-	req2.Body = body
+	if req.GetBody != nil {
+		body, berr := req.GetBody()
+		if berr != nil {
+			return resp, err
+		}
+		req2.Body = body
+	}
 	req2.URL.Host = refreshed.Endpoint.MCPAddr()
 	req2.Host = substrateHostOrDefault(t.backendKind, refreshed.ID, req2.URL.Host)
 	return t.inner.RoundTrip(req2)
+}
+
+// isDialFailure reports whether err represents a failure to establish the
+// connection at all (as opposed to a failure after connecting), by checking
+// for a *net.OpError with Op == "dial". Only this class of failure implies the
+// cached endpoint itself is unreachable and worth re-resolving.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -153,20 +174,30 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request, sess *sessi
 	r2.Host = substrateHostOrDefault(h.Backend, sess.ID, target.Host)
 	r2.RequestURI = ""
 
-	// Buffer the body and set GetBody so retryingTransport can replay the
-	// request once if the cached endpoint turns out to be stale (see
+	// Buffer up to maxReplayBodyBytes and set GetBody so retryingTransport can
+	// replay the request once if the cached endpoint turns out to be stale (see
 	// retryingTransport.RoundTrip). MCP-over-HTTP payloads are small
-	// control-plane calls, so buffering them is cheap.
+	// control-plane calls, so buffering them is cheap; a body larger than the
+	// cap is streamed through unbuffered and simply won't be retried.
 	if r2.Body != nil && r2.Body != http.NoBody {
-		buf, readErr := io.ReadAll(r2.Body)
-		r2.Body.Close()
+		buf, readErr := io.ReadAll(io.LimitReader(r2.Body, maxReplayBodyBytes+1))
 		if readErr != nil {
+			if closeErr := r2.Body.Close(); closeErr != nil {
+				h.Log.Warn("closing request body", "err", closeErr)
+			}
 			http.Error(w, fmt.Sprintf("reading request body: %v", readErr), http.StatusBadGateway)
 			return
 		}
-		r2.Body = io.NopCloser(bytes.NewReader(buf))
-		r2.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(buf)), nil
+		if int64(len(buf)) > maxReplayBodyBytes {
+			r2.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), r2.Body))
+		} else {
+			if closeErr := r2.Body.Close(); closeErr != nil {
+				h.Log.Warn("closing request body", "err", closeErr)
+			}
+			r2.Body = io.NopCloser(bytes.NewReader(buf))
+			r2.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(buf)), nil
+			}
 		}
 	}
 	r2 = r2.WithContext(context.WithValue(r2.Context(), sessCtxKey{}, sess))
