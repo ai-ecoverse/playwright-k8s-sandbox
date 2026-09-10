@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    ":dependencyDashboard",
+    ":separateMultipleMajorReleases",
+    ":separateMultipleMinorReleases",
+    ":separatePatchReleases",
+    ":ignoreUnstable",
+    ":prImmediately",
+    ":semanticPrefixFixDepsChoreOthers",
+    ":updateNotScheduled",
+    ":automergeDisabled",
+    ":autodetectPinVersions",
+    "group:monorepos",
+    "group:recommended",
+    "helpers:disableTypesNodeMajor",
+    ":prHourlyLimitNone",
+    "docker:enableMajor",
+    "regexManagers:dockerfileVersions"
+  ],
+  "pinDigests": true,
+  "prConcurrentLimit": 10,
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "automerge": true
+    }
+  ]
+}
