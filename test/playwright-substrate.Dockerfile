@@ -20,7 +20,7 @@
 # with chromium.launchServer, so server.js spawns it as a second listener.
 # playwright is pinned to 1.53.0 because that is the version @playwright/mcp
 # @0.0.29 depends on; both share the single installed Chromium build.
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
 # Playwright installs browsers into a stable path; freeze it at build time so
 # the install-deps step puts the system libs where chromium will look.
