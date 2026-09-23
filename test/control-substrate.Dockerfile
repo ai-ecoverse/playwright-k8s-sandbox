@@ -2,7 +2,7 @@
 # Pure Node + a single-file server, no browser. If THIS doesn't reach
 # STATUS_RUNNING under substrate's golden-actor workflow, the failure isn't
 # Chromium-specific.
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2
 
 WORKDIR /app
 COPY server.js /app/server.js
