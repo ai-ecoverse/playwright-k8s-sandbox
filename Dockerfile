@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.27 AS build
+FROM golang:1.27@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS build
 WORKDIR /src
 
 # Download dependencies first for better layer caching
@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
     -o /out/playwright-proxy ./cmd/playwright-proxy
 
 # Runtime stage - use distroless for minimal attack surface
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 # Copy binary with appropriate permissions
 COPY --from=build --chown=nonroot:nonroot /out/playwright-proxy /usr/local/bin/playwright-proxy
