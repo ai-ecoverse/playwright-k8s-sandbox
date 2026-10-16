@@ -94,6 +94,47 @@ snapshot configuration, and explicit egress, use the
 
 ## Local kind tests
 
+`test/versions.env` pins Kubernetes **v1.37.1**, the latest upstream stable
+checked on 2026-10-16 against <https://dl.k8s.io/release/stable.txt>.
+Both primary and substrate creation paths explicitly use
+`playwright-kind-node:v1.37.1`; neither follows kind's changing default or
+silently falls back to an older Kubernetes release.
+
+There is no official `kindest/node:v1.37.1` image as of that check. On the
+first creation, the harness builds a local node image from the exact
+Kubernetes release using **kind v0.33.0**, then reuses it. The equivalent
+manual preparation command is:
+
+```sh
+kind build node-image --type release --image playwright-kind-node:v1.37.1 v1.37.1
+```
+
+The release and builder versions are committed, not resolved from `latest`
+at deployment time. This is a local architecture-specific build recipe,
+not a published multiarchitecture image digest or a claim of bit-for-bit
+identical builds. Updating the Kubernetes pin selects a new local image tag.
+No v1.37.1 deployment or backend rerun is claimed by these script changes;
+historical benchmark results remain unchanged.
+
+Existing clusters on another version require
+`ALLOW_EXISTING_KUBERNETES_VERSION=1` to explicitly reuse them; they are never
+deleted or upgraded automatically, or counted as latest-version tests.
+The substrate configuration retains certificate feature gates, v1beta1
+certificate APIs, optional KVM, IP-family selection and its local registry;
+the harness does not invoke upstream's destructive cluster creation script.
+
+New cluster credentials go to `.backend-sources/kubeconfig`, merged with
+`$KUBECONFIG` (or `~/.kube/config`) inside the harness. The global current
+context is unchanged. For manual commands against a newly created cluster:
+
+```sh
+KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}:$PWD/.backend-sources/kubeconfig" \
+  kubectl --context kind-NEW-CLUSTER get nodes
+```
+
+The commands below enforce these version checks. Use new `CLUSTER` and
+`SUBSTRATE_CLUSTER` names to retain existing clusters on older versions:
+
 ```sh
 bash test/harness.sh up
 bash test/harness.sh e2e

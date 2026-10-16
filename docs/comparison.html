@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="A visual comparison of the agent-sandbox, isola, KARS, and substrate browser integrations: control planes, runtime boundaries, traffic, and lifecycle.">
+  <title>Four sandbox models | Playwright on Kubernetes</title>
+  <style>
+    :root {
+      --paper: #f5f3ed;
+      --surface: #fffefa;
+      --ink: #202d35;
+      --muted: #53616a;
+      --line: #c7cdc9;
+      --blue: #164e72;
+      --blue-wash: #e8f0f4;
+      --green: #23624e;
+      --green-wash: #eaf2eb;
+      --rust: #914721;
+      --rust-wash: #f7ede3;
+      --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.6 var(--sans); }
+    ::selection { background: #c6dfeb; color: var(--ink); }
+    :focus-visible { outline: 3px solid var(--rust); outline-offset: 5px; }
+    a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 4px; }
+    a:hover { text-decoration-thickness: 2px; }
+    button { font: inherit; cursor: pointer; }
+    [hidden] { display: none !important; }
+    code { font: .84em/1.5 var(--mono); overflow-wrap: anywhere; }
+    h1, h2, h3, p { margin: 0; }
+    h1, h2 { font-family: var(--serif); font-weight: 500; text-wrap: balance; }
+    h1 { font-size: clamp(2.9rem, 6.4vw, 5.6rem); line-height: 1.04; letter-spacing: -.035em; }
+    h2 { font-size: clamp(1.8rem, 3.2vw, 2.6rem); line-height: 1.2; letter-spacing: -.02em; }
+    h3 { font-size: 1.05rem; line-height: 1.35; }
+    p { max-width: 70ch; }
+    .wrap { width: min(1320px, calc(100% - 64px)); margin-inline: auto; }
+    .skip { position: absolute; top: -100px; left: 24px; padding: 10px 16px; background: var(--surface); z-index: 2; }
+    .skip:focus { top: 12px; }
+    .masthead { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding-block: 25px; border-bottom: 1px solid var(--ink); }
+    .wordmark { display: flex; align-items: center; gap: 12px; color: var(--ink); font-weight: 650; text-decoration: none; }
+    .wordmark svg { color: var(--blue); flex: none; }
+    nav { display: flex; gap: 24px; font-size: .85rem; }
+    nav a { color: var(--ink); }
+    .intro { display: grid; grid-template-columns: 1.2fr 1fr; align-items: end; gap: 64px; padding-block: 66px 50px; }
+    .intro h1 span { color: var(--blue); }
+    .intro p { font-size: 1.08rem; line-height: 1.7; }
+    .intro .edition { margin-top: 20px; font-size: .8rem; color: var(--muted); }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 32px; margin-bottom: 26px; }
+    .section-head > p { max-width: 49ch; color: var(--muted); font-size: .9rem; }
+    .front-door { padding: 28px 32px; background: var(--blue); color: var(--surface); }
+    .front-door h2 { font: 600 1rem/1.4 var(--sans); margin-bottom: 24px; }
+    .entry-flow { display: grid; grid-template-columns: 1fr 54px 1.4fr 54px 1fr; align-items: center; }
+    .entry-node { padding: 16px 18px; border: 1px solid #a8c6d6; min-height: 104px; }
+    .entry-node strong { display: block; font-size: 1rem; margin-bottom: 5px; }
+    .entry-node small { display: block; font-size: .82rem; color: #d3e5ed; }
+    .entry-node code { color: var(--surface); }
+    .entry-node.proxy { background: #255e80; }
+    .entry-arrow { width: 100%; height: 24px; color: #d3e5ed; }
+    .entry-arrow.control { stroke-dasharray: 4 4; }
+    .entry-note { color: #d3e5ed; margin-top: 18px; font-size: .8rem; }
+    .plate { margin-top: 58px; }
+    .plate-tools { display: flex; justify-content: space-between; align-items: center; gap: 22px; margin-block: 24px 18px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 20px; font-size: .78rem; color: var(--muted); }
+    .legend span { display: flex; align-items: center; gap: 8px; }
+    .legend i { width: 24px; border-top: 2px dashed var(--muted); }
+    .legend i.traffic { border-top: 2px solid var(--blue); }
+    .focus-controls { display: flex; flex-wrap: wrap; border: 1px solid var(--line); }
+    .focus-controls button { border: 0; background: transparent; color: var(--ink); padding: 8px 13px; font-size: .8rem; }
+    .focus-controls button:hover { background: var(--blue-wash); }
+    .focus-controls button[aria-pressed="true"] { background: var(--ink); color: var(--surface); text-decoration: underline; text-underline-offset: 4px; }
+    .focus-note { margin-bottom: 28px; min-height: 1.6em; color: var(--muted); font-size: .82rem; }
+    .lanes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }
+    .lane { min-width: 0; padding: 27px 22px 26px; }
+    .lane + .lane { border-left: 1px solid var(--line); }
+    .lane header { min-height: 106px; }
+    .lane h3 { font-size: 1.22rem; letter-spacing: -.025em; }
+    .version { color: var(--muted); font: .8rem/1.6 var(--mono); margin-top: 4px; }
+    .lane header p:last-child { color: var(--muted); font-size: .82rem; margin-top: 12px; }
+    .path-label { margin-bottom: 10px; color: var(--muted); font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+    .node { padding: 14px; border: 1px dashed #87989e; background: var(--surface); min-height: 112px; display: flex; flex-direction: column; justify-content: center; }
+    .node strong { font-size: .85rem; font-weight: 600; line-height: 1.4; }
+    .node small { font-size: .8rem; margin-top: 5px; color: var(--muted); line-height: 1.5; }
+    .node code { font-size: .8rem; }
+    .connector { position: relative; height: 36px; margin-left: 50%; border-left: 1px dashed #87989e; }
+    .connector::after { content: ""; position: absolute; left: -4px; bottom: 2px; width: 6px; height: 6px; border-right: 1px solid #87989e; border-bottom: 1px solid #87989e; transform: rotate(45deg); }
+    .boundary { position: relative; min-height: 245px; padding: 16px 12px 12px; border: 1px solid #87989e; background: var(--blue-wash); }
+    .boundary > .scope { display: block; font-size: .8rem; margin-bottom: 16px; color: var(--blue); }
+    .runtime { border: 1px solid var(--blue); padding: 13px 10px; background: var(--surface); }
+    .runtime strong { display: block; font-size: .86rem; line-height: 1.4; }
+    .runtime small { display: block; color: var(--muted); font-size: .8rem; line-height: 1.5; margin-top: 7px; }
+    .boundary .runtime-tag { display: block; margin-top: 12px; color: var(--blue); font-size: .8rem; }
+    .lane.substrate .boundary { background: var(--green-wash); }
+    .lane.substrate .scope, .lane.substrate .runtime-tag { color: var(--green); }
+    .lane.substrate .runtime { border-color: var(--green); }
+    .data-path { margin-top: 23px; padding-block: 15px; border-block: 2px solid var(--blue); min-height: 126px; }
+    .data-path .path-label { color: var(--blue); }
+    .data-path strong { font-size: .85rem; display: block; line-height: 1.5; }
+    .data-path code { display: block; margin-top: 6px; font-size: .8rem; }
+    .data-path small { color: var(--muted); display: block; font-size: .8rem; margin-top: 6px; }
+    .lane-footer { padding-top: 19px; font-size: .8rem; line-height: 1.6; }
+    .lane-footer strong { display: block; margin-bottom: 5px; }
+    [data-focus="control"] .node { border: 2px dashed var(--ink); padding: 13px; }
+    [data-focus="control"] .data-path { border-color: var(--line); }
+    [data-focus="traffic"] .data-path { background: var(--blue-wash); padding-inline: 10px; }
+    [data-focus="traffic"] .runtime { outline: 2px solid var(--blue); outline-offset: 3px; }
+    [data-focus="traffic"] .node { background: var(--paper); }
+    .caption { color: var(--muted); font-size: .78rem; margin-top: 18px; max-width: 95ch; }
+    .comparison { margin-top: 72px; }
+    .comparison h2 { margin-bottom: 18px; }
+    .table-wrap { overflow-x: auto; scrollbar-color: var(--blue) var(--paper); }
+    table { width: 100%; min-width: 870px; border-collapse: collapse; font-size: .83rem; }
+    caption { text-align: left; color: var(--muted); font-size: .85rem; margin-bottom: 20px; }
+    th, td { text-align: left; vertical-align: top; padding: 17px 18px; border-bottom: 1px solid var(--line); width: 21%; }
+    thead th { background: var(--ink); color: var(--surface); font-weight: 550; border: 0; }
+    th:first-child { width: 16%; }
+    tbody th { font-weight: 550; background: #eceee8; }
+    tbody tr:last-child > * { border-bottom: 1px solid var(--ink); }
+    .lifecycle { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; margin-top: 72px; padding-bottom: 58px; border-bottom: 1px solid var(--ink); }
+    .lifecycle h2 { margin-bottom: 24px; }
+    .lifecycle p + p { margin-top: 18px; }
+    .state-diagram { align-self: center; padding: 26px 28px; background: var(--green-wash); }
+    .state-diagram h3 { color: var(--green); margin-bottom: 20px; }
+    .state-row { display: grid; grid-template-columns: 1fr 58px 1fr; align-items: center; gap: 10px; }
+    .state { border: 1px solid var(--green); padding: 12px; text-align: center; font-size: .84rem; background: var(--surface); }
+    .state-arrow { color: var(--green); text-align: center; font-size: .8rem; }
+    .state-arrow svg { width: 100%; height: 18px; display: block; }
+    .state-diagram > p { font-size: .8rem; color: var(--green); margin-top: 18px; }
+    .context { padding-block: 36px; }
+    details { border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+    summary { padding-block: 18px; font-weight: 550; cursor: pointer; }
+    summary:hover { color: var(--blue); }
+    details .detail-body { padding-block: 4px 24px; }
+    details p { color: var(--muted); font-size: .9rem; }
+    .ax-path { margin-top: 18px; padding: 18px 20px; border: 1px solid var(--rust); color: var(--rust); font-size: .85rem; }
+    footer { display: flex; justify-content: space-between; gap: 36px; padding-block: 20px 44px; font-size: .78rem; color: var(--muted); }
+    footer p { max-width: 69ch; }
+    footer a { white-space: nowrap; }
+    @media (max-width: 1200px) {
+      .intro { gap: 35px; }
+      .lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .lane:nth-child(3) { border-left: 0; }
+      .lane:nth-child(n+3) { border-top: 1px solid var(--line); }
+      .lane header { min-height: 105px; }
+      .lifecycle { gap: 32px; }
+    }
+    @media (max-width: 700px) {
+      .wrap { width: calc(100% - 36px); }
+      .masthead { align-items: flex-start; flex-direction: column; gap: 15px; padding-block: 20px; }
+      nav { gap: 22px; }
+      .intro { grid-template-columns: 1fr; gap: 25px; padding-block: 40px 32px; }
+      .intro p { font-size: 1rem; }
+      .front-door { padding: 23px 20px; }
+      .entry-flow { grid-template-columns: 1fr; }
+      .entry-node { min-height: auto; padding: 14px 16px; }
+      .entry-arrow { width: 50px; height: 38px; margin-inline: auto; transform: rotate(90deg); }
+      .section-head, .plate-tools { flex-direction: column; align-items: flex-start; gap: 16px; }
+      .section-head { margin-bottom: 22px; }
+      .plate { margin-top: 40px; }
+      .plate-tools { margin-block: 20px; }
+      .lanes { grid-template-columns: 1fr; }
+      .lane { padding: 25px 16px; }
+      .lane + .lane { border-left: 0; border-top: 1px solid var(--line); }
+      .lane header { min-height: 0; padding-bottom: 25px; }
+      .boundary { min-height: 0; }
+      .node { min-height: 0; }
+      .data-path { min-height: 0; }
+      .comparison, .lifecycle { margin-top: 48px; }
+      .lifecycle { grid-template-columns: 1fr; padding-bottom: 38px; }
+      .state-diagram { padding: 22px 18px; }
+      footer { flex-direction: column; gap: 18px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @media print {
+      :root { --paper: #fff; }
+      body { font-size: 12px; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .wrap { width: 100%; }
+      .masthead, .focus-controls, .focus-note, .skip { display: none !important; }
+      .intro { padding-block: 12px 24px; }
+      h1 { font-size: 40px; }
+      h2 { font-size: 25px; }
+      .lanes { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .lane { padding-inline: 10px; break-inside: avoid; }
+      .lane:nth-child(3) { border-left: 1px solid var(--line); }
+      .lane:nth-child(n+3) { border-top: 0; }
+      .table-wrap { overflow: visible; }
+      table { min-width: 0; }
+      .plate, .comparison, .lifecycle { margin-top: 30px; }
+      a { color: inherit; }
+      details:not([open]) { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to comparison</a>
+  <header class="masthead wrap">
+    <a class="wordmark" href="../README.md">
+      <svg width="28" height="30" viewBox="0 0 28 30" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <path d="m14 2 12 7v13l-12 7L2 22V9L14 2Z M2 9l12 7 12-7 M14 16v13"/>
+        <path d="m8 5 12 7v7"/>
+      </svg>
+      Playwright / Kubernetes
+    </a>
+    <nav aria-label="Page sections">
+      <a href="#paths">Architecture</a>
+      <a href="#boundaries">Boundaries</a>
+      <a href="#lifecycle">Lifecycle</a>
+    </nav>
+  </header>
+  <main id="main" class="wrap">
+    <section class="intro" aria-labelledby="title">
+      <h1 id="title">One proxy.<br><span>Four sandbox models.</span></h1>
+      <div>
+        <p>The browser endpoint stays the same. What changes is who provisions
+          the sandbox, where its isolation boundary sits, and what happens
+          when the session ends.</p>
+        <p class="edition">Architecture of this repository's four upgraded integrations.
+          Release pins checked October 16, 2026.</p>
+      </div>
+    </section>
+
+    <section class="front-door" aria-labelledby="front-title">
+      <h2 id="front-title">The shared front door</h2>
+      <div class="entry-flow">
+        <div class="entry-node">
+          <strong>Calling agent Pod</strong>
+          <small>Source Pod IP resolves to</small>
+          <code>playwright-id: alpha</code>
+        </div>
+        <svg class="entry-arrow" viewBox="0 0 54 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M0 12h51m-6-5 7 5-7 5"/></svg>
+        <div class="entry-node proxy">
+          <strong>playwright-proxy</strong>
+          <small>Identify caller &middot; reuse session or provision once</small>
+          <small>HTTP + native Playwright WebSocket forwarding</small>
+        </div>
+        <svg class="entry-arrow control" viewBox="0 0 54 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M0 12h51"/><path d="m45 7 7 5-7 5" stroke-dasharray="none"/></svg>
+        <div class="entry-node">
+          <strong>Backend contract</strong>
+          <code>Ensure(id)</code>
+          <code>Delete(id) &middot; List()</code>
+        </div>
+      </div>
+      <p class="entry-note">The session manager caches the resolved endpoint.
+        Browser traffic then follows the backend-specific data path below.</p>
+    </section>
+
+    <section id="paths" class="plate" aria-labelledby="paths-title" data-focus="all">
+      <div class="section-head">
+        <h2 id="paths-title">Four paths to a browser.</h2>
+        <p>Read each lane from resource creation to runtime.
+          The solid blue route is the actual browser data plane.</p>
+      </div>
+      <div class="plate-tools">
+        <div class="legend" aria-label="Diagram legend">
+          <span><i aria-hidden="true"></i> Control / provisioning</span>
+          <span><i class="traffic" aria-hidden="true"></i> Browser traffic</span>
+        </div>
+        <div class="focus-controls" role="group" aria-label="Emphasize a diagram layer" hidden>
+          <button type="button" data-mode="all" aria-pressed="true">All layers</button>
+          <button type="button" data-mode="control" aria-pressed="false">Provisioning</button>
+          <button type="button" data-mode="traffic" aria-pressed="false">Browser traffic</button>
+        </div>
+      </div>
+      <p class="focus-note" aria-live="polite">Control and data paths are both shown.</p>
+      <div class="lanes">
+        <article class="lane" aria-labelledby="agent-title">
+          <header>
+            <h3 id="agent-title">agent-sandbox</h3>
+            <p class="version">v1.0.7</p>
+            <p>Claim an already-running browser.</p>
+          </header>
+          <p class="path-label">Control path</p>
+          <div class="node"><strong>SandboxClaim</strong><small>Kubernetes custom resource</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="node"><strong>agent-sandbox controller</strong><small>Bind a Sandbox from the SandboxWarmPool</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="boundary">
+            <span class="scope">Sandbox Pod / namespace scope</span>
+            <div class="runtime"><strong>Playwright + Chromium</strong><small>A warm Pod is allocated to this claim.</small></div>
+            <span class="runtime-tag">Pod-based runtime</span>
+          </div>
+          <div class="data-path">
+            <p class="path-label">Browser traffic</p>
+            <strong>Proxy &rarr; bound Pod IP</strong>
+            <code>WebSocket :9222</code>
+            <small>Direct, without sandbox-router</small>
+          </div>
+          <p class="lane-footer"><strong>Allocation model</strong>Pool capacity is prepared before the request.
+            Deleting the claim destroys the assigned Pod.</p>
+        </article>
+
+        <article class="lane" aria-labelledby="isola-title">
+          <header>
+            <h3 id="isola-title">isola</h3>
+            <p class="version">v0.7.0 &middot; chart 0.7.0</p>
+            <p>Create a gVisor-isolated Pod.</p>
+          </header>
+          <p class="path-label">Control path</p>
+          <div class="node"><strong>Sandbox</strong><small>CR in <code>sandbox.isola.run</code></small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="node"><strong>isola operator</strong><small>Create Pod with the gVisor RuntimeClass</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="boundary">
+            <span class="scope">Shared <code>isola-sandboxes</code> namespace</span>
+            <div class="runtime"><strong>Playwright + Chromium</strong><small>Pod runs inside a runsc sandbox.</small></div>
+            <span class="runtime-tag">gVisor at the Pod runtime boundary</span>
+          </div>
+          <div class="data-path">
+            <p class="path-label">Browser traffic</p>
+            <strong>Proxy &rarr; sandbox Pod IP</strong>
+            <code>WebSocket :9222</code>
+            <small>NetworkPolicy surrounds the Pod</small>
+          </div>
+          <p class="lane-footer"><strong>Allocation model</strong>On-demand Pod creation in one shared namespace.
+            The adapter uses delete/recreate.</p>
+        </article>
+
+        <article class="lane" aria-labelledby="kars-title">
+          <header>
+            <h3 id="kars-title">Azure KARS</h3>
+            <p class="version">v0.1.26</p>
+            <p>Give each sandbox its own namespace.</p>
+          </header>
+          <p class="path-label">Control path</p>
+          <div class="node"><strong>KarsSandbox</strong><small>Kubernetes custom resource</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="node"><strong>KARS controller</strong><small>Apply governance and provision the sandbox namespace</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="boundary">
+            <span class="scope">Dedicated <code>kars-pw-*</code> namespace</span>
+            <div class="runtime"><strong>BYO Playwright Pod + guard</strong><small>Policies and the egress guard surround browser execution.</small></div>
+            <span class="runtime-tag">Namespace + network / egress boundaries</span>
+          </div>
+          <div class="data-path">
+            <p class="path-label">Browser traffic</p>
+            <strong>Proxy &rarr; ready Pod IP</strong>
+            <code>WebSocket :9222</code>
+            <small>Not the inference Service on :8443</small>
+          </div>
+          <p class="lane-footer"><strong>Allocation model</strong>Wait for the actual PodReady condition.
+            Deletion removes the sandbox namespace.</p>
+        </article>
+
+        <article class="lane substrate" aria-labelledby="substrate-title">
+          <header>
+            <h3 id="substrate-title">substrate</h3>
+            <p class="version">v0.5.0</p>
+            <p>Schedule an actor on a runtime worker.</p>
+          </header>
+          <p class="path-label">Control path</p>
+          <div class="node"><strong>Actor + ActorTemplate</strong><small>Atespace-scoped API resources via gRPC</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="node"><strong>Control API / WorkerPool</strong><small>Assign the actor to an ateom worker</small></div>
+          <div class="connector" aria-hidden="true"></div>
+          <div class="boundary">
+            <span class="scope">Worker Pod running ateom</span>
+            <div class="runtime"><strong>gVisor actor sandbox</strong><small>Playwright + multiprocess Chromium run inside the worker-managed sandbox.</small></div>
+            <span class="runtime-tag">Nested runtime, not a Pod per actor</span>
+          </div>
+          <div class="data-path">
+            <p class="path-label">Browser traffic</p>
+            <strong>Proxy &rarr; atenet-router :80</strong>
+            <code>ate-target-actor: atespace/name</code>
+            <small>The proxy sets the trusted actor header</small>
+          </div>
+          <p class="lane-footer"><strong>Allocation model</strong>Create or resume a scoped Actor.
+            Explicit suspension can preserve memory state.</p>
+        </article>
+      </div>
+      <p class="caption">These are the paths implemented by this repository,
+        not every topology offered upstream. OpenShell is also supported by
+        the proxy but shares the SandboxClaim adapter and is outside this four-backend upgrade.</p>
+    </section>
+
+    <section id="boundaries" class="comparison" aria-labelledby="boundaries-title">
+      <h2 id="boundaries-title">Where the boundaries sit.</h2>
+      <div class="table-wrap" role="region" aria-label="Backend boundary comparison; scroll horizontally on small screens" tabindex="0">
+        <table>
+          <caption>The resource model is not the isolation model. A namespace scopes
+            Kubernetes objects; gVisor changes the workload's runtime boundary.</caption>
+          <thead><tr><th scope="col">Dimension</th><th scope="col">agent-sandbox</th><th scope="col">isola</th><th scope="col">KARS</th><th scope="col">substrate</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Session resource</th><td>SandboxClaim CR</td><td>Sandbox CR</td><td>KarsSandbox CR</td><td>Actor API resource</td></tr>
+            <tr><th scope="row">Runtime placement</th><td>Pod allocated from a warm pool</td><td>On-demand gVisor Pod</td><td>BYO Pod in a dedicated namespace</td><td>gVisor sandbox inside an ateom worker</td></tr>
+            <tr><th scope="row">Namespace model</th><td>Namespace-scoped claims and pool</td><td>Shared sandbox namespace</td><td>Namespace per sandbox</td><td>Atespace is an API scope; workers are Kubernetes Pods</td></tr>
+            <tr><th scope="row">Traffic selection</th><td>Bound Pod endpoint</td><td>Sandbox Pod endpoint</td><td>Ready Pod endpoint + proxy-only ingress</td><td>Router + trusted actor header</td></tr>
+            <tr><th scope="row">Egress model</th><td>Configured Pod networking and policies</td><td>Operator policies + fixture-specific NetworkPolicy</td><td>Governance policies + guarded egress</td><td>Actor EgressPolicy enforced by substrate</td></tr>
+            <tr><th scope="row">After adapter Delete</th><td>Fresh claim / fresh Pod</td><td>Fresh Sandbox / fresh Pod</td><td>Fresh resource / namespace</td><td>Fresh Actor; Delete is not Suspend</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="lifecycle" class="lifecycle" aria-labelledby="lifecycle-title">
+      <div>
+        <h2 id="lifecycle-title">A restart is not a restore.</h2>
+        <p><strong>Reuse is common to all four.</strong> While a session is alive,
+          the same <code>playwright-id</code> maps to the cached endpoint.
+          An active WebSocket keeps that session from being reaped.</p>
+        <p><strong>Idle reaping deletes, in all four adapters.</strong>
+          The next request provisions a new sandbox. It does not
+          automatically restore the previous browser session.</p>
+        <p><strong>Substrate adds a separate suspend/resume path.</strong>
+          An explicit memory-fidelity snapshot can preserve a suspended actor.
+          The lifecycle exercise used this path rather than forced boot.</p>
+      </div>
+      <div class="state-diagram" role="group" aria-label="Substrate explicit suspend and resume lifecycle">
+        <h3>Substrate's explicit snapshot path</h3>
+        <div class="state-row">
+          <span class="state">Running actor</span>
+          <span class="state-arrow">suspend<svg viewBox="0 0 58 18" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1 9h53m-6-5 7 5-7 5"/></svg></span>
+          <span class="state">Suspended<br>memory snapshot</span>
+        </div>
+        <div class="state-row" style="margin-top:18px">
+          <span class="state">Running actor</span>
+          <span class="state-arrow">resume<svg viewBox="0 0 58 18" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M57 9H4m6-5L3 9l7 5"/></svg></span>
+          <span class="state">Router receives<br>a new request</span>
+        </div>
+        <p>Memory-fidelity suspension, durable snapshot completion, and
+          subsequent browser navigation were observed in the recorded kind run.</p>
+      </div>
+    </section>
+
+    <section class="context" aria-label="Related architectural layers">
+      <details>
+        <summary>Where do agent-sandbox snapshots, sandboxd, and sandbox-router fit?</summary>
+        <div class="detail-body"><p>They are separate upstream options, not hidden
+          steps in the direct-Pod path above. GKE Pod Snapshots provide checkpoint/restore,
+          including a golden-snapshot warm-pool example. <code>sandboxd</code> provides
+          process and filesystem APIs; <code>sandbox-router</code> forwards traffic
+          to existing sandboxes. Neither component is itself the checkpoint engine.</p></div>
+      </details>
+      <details>
+        <summary>Where does Google AX fit?</summary>
+        <div class="detail-body">
+          <p>AX adds task, workspace, and model orchestration above substrate.
+            It is not a fifth independent isolation runtime.</p>
+          <div class="ax-path">AX Tasks / workspaces + Redis &rarr; substrate Actors &rarr; runtime workers</div>
+        </div>
+      </details>
+    </section>
+  </main>
+  <footer class="wrap">
+    <p>Sources: <a href="blog/sandbox-updates-2026-10.md">repository-baseline upgrade notes</a>,
+      <a href="ARCHITECTURE.md">architecture reference</a>, and the
+      <a href="../test/results/2026-10-16-kind.json">recorded kind run</a>.
+      No performance ranking is implied.</p>
+    <a href="../test/versions.env">Committed version pins</a>
+  </footer>
+  <script>
+    const plate = document.querySelector(".plate");
+    const controls = document.querySelector(".focus-controls");
+    const note = document.querySelector(".focus-note");
+    const descriptions = {
+      all: "Control and data paths are both shown.",
+      control: "Dashed resource and controller boxes are emphasized. They provision the browser runtime.",
+      traffic: "Solid blue routes and runtime endpoints are emphasized. These carry browser requests and WebSockets."
+    };
+    controls.hidden = false;
+    controls.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-mode]");
+      if (!button) return;
+      const mode = button.dataset.mode;
+      plate.dataset.focus = mode;
+      for (const item of controls.querySelectorAll("button")) {
+        item.setAttribute("aria-pressed", String(item === button));
+      }
+      note.textContent = descriptions[mode];
+    });
+  </script>
+</body>
+</html>

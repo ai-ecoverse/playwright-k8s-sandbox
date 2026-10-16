@@ -1,5 +1,8 @@
 # Architecture
 
+For a standalone visual comparison of the four upgraded implementations, open
+[the architecture comparison](comparison.html) in a browser.
+
 **Release update (October 2026):** see the
 [pinned release migration and kind rerun](blog/sandbox-updates-2026-10.md) for
 agent-sandbox v1.0.7, isola v0.7.0, KARS v0.1.26 and substrate v0.5.0.

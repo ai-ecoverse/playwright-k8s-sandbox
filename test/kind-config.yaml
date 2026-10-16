@@ -1,5 +1,6 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: playwright-proxy
+# Node image comes from test/versions.env via --image; never kind's default.
+# The harness supplies --name so CLUSTER overrides apply consistently.
 nodes:
   - role: control-plane

@@ -27,6 +27,10 @@ ROOT="$(cd "$HERE/.." && pwd)"
 CLUSTER="${CLUSTER:-playwright-proxy}"
 NAMESPACE="${NAMESPACE:-pw-test}"
 source "$HERE/versions.env"
+# shellcheck source=test/kind-cluster.sh
+source "$HERE/kind-cluster.sh"
+HARNESS_KUBECONFIG="$ROOT/.backend-sources/kubeconfig"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}:$HARNESS_KUBECONFIG"
 PROXY_IMAGE="${PROXY_IMAGE:-playwright-proxy:dev}"
 
 # Explicit backend contexts below override this default; never depend on the
@@ -78,9 +82,10 @@ ensure_source() {
 cmd_up() {
   log "creating kind cluster '$CLUSTER'"
   if ! kind get clusters | grep -qx "$CLUSTER"; then
-    kind create cluster --name "$CLUSTER" --config "$HERE/kind-config.yaml" --wait 120s
+    create_pinned_kind_cluster "$CLUSTER" "$HERE/kind-config.yaml"
   else
-    log "cluster '$CLUSTER' already exists; reusing"
+    check_existing_kind_cluster "$CLUSTER"
+    log "cluster '$CLUSTER' already exists; explicitly verified/reusing"
   fi
 
   log "installing agent-sandbox $AGENT_SANDBOX_VERSION"
@@ -629,9 +634,6 @@ install_kars_helm() {
 }
 
 cmd_up_kars() {
-  ensure_source Azure/kars "$KARS_VERSION" "$KARS_REPO"
-  require_kars_repo
-
   # Require the cluster to exist. The kars backend test runs inside the same
   # kind cluster as agent-sandbox (default: $CLUSTER = playwright-proxy) to
   # avoid spinning up a third node container when Docker resources are shared
@@ -639,6 +641,9 @@ cmd_up_kars() {
   if ! kind get clusters 2>/dev/null | grep -qx "$KARS_CLUSTER"; then
     fail "cluster '$KARS_CLUSTER' not found — run './harness.sh up' first"
   fi
+  check_existing_kind_cluster "$KARS_CLUSTER"
+  ensure_source Azure/kars "$KARS_VERSION" "$KARS_REPO"
+  require_kars_repo
   log "installing kars into existing cluster '$KARS_CLUSTER'"
 
   # Label the control-plane node so the kars controller's nodeSelector
@@ -783,6 +788,7 @@ cmd_up_isola() {
   if ! kind get clusters 2>/dev/null | grep -qx "$ISOLA_CLUSTER"; then
     fail "cluster '$ISOLA_CLUSTER' not found — run './harness.sh up' first"
   fi
+  check_existing_kind_cluster "$ISOLA_CLUSTER"
   log "installing isola into existing cluster '$ISOLA_CLUSTER'"
 
   bash "$HERE/install-gvisor-kind.sh" "$ISOLA_CLUSTER"
@@ -941,10 +947,12 @@ KUBECTL_ATE="${KUBECTL_ATE:-$SUBSTRATE_REPO/bin/kubectl-ate}"
 substrate_ctx_args() { echo "--context=kind-$SUBSTRATE_CLUSTER"; }
 
 cmd_up_substrate() {
-  ensure_source agent-substrate/substrate "$SUBSTRATE_VERSION" "$SUBSTRATE_REPO"
   if ! kind get clusters | grep -qx "$SUBSTRATE_CLUSTER"; then
-    (cd "$SUBSTRATE_REPO" && KIND_CLUSTER_NAME="$SUBSTRATE_CLUSTER" hack/create-kind-cluster.sh)
+    create_substrate_kind_cluster "$SUBSTRATE_CLUSTER"
+  else
+    check_existing_kind_cluster "$SUBSTRATE_CLUSTER"
   fi
+  ensure_source agent-substrate/substrate "$SUBSTRATE_VERSION" "$SUBSTRATE_REPO"
   # Envoy's watches need more than Docker's common default of 128 instances.
   local node current
   for node in $(kind get nodes --name "$SUBSTRATE_CLUSTER"); do
@@ -954,6 +962,7 @@ cmd_up_substrate() {
     fi
   done
   (cd "$SUBSTRATE_REPO" && KIND_CLUSTER_NAME="$SUBSTRATE_CLUSTER" \
+    KUBECTL_CONTEXT="kind-$SUBSTRATE_CLUSTER" \
     BUILDX_BUILDER="${BUILDX_BUILDER:-$(docker context show)}" \
     hack/install-ate-kind.sh --deploy-ate-system --credential-provider='{"enabled":false}' --rollout-timeout 300s)
 }
@@ -963,12 +972,9 @@ require_substrate() {
   if ! kubectl $(substrate_ctx_args) get ns ate-system >/dev/null 2>&1; then
     cat <<EOF >&2
 Substrate's ate-system namespace was not found in cluster '$SUBSTRATE_CLUSTER'.
-Install it first using substrate's own scripts:
+Install it using the pinned harness (creates the cluster + local registry):
 
-  cd "$SUBSTRATE_REPO"
-  hack/create-kind-cluster.sh                       # creates the 'kind' cluster + local registry
-  PATH="\$PATH:\$(go env GOPATH)/bin" \\
-    hack/install-ate-kind.sh --deploy-ate-system    # builds and applies ate-system (needs ko)
+  SUBSTRATE_CLUSTER="$SUBSTRATE_CLUSTER" $0 up-substrate
 
 Prerequisites: ko (\`go install github.com/google/ko@latest\`).
 Then re-run: $0 test substrate
