@@ -116,7 +116,7 @@ func (t *retryingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		req2.Body = body
 	}
 	req2.URL.Host = refreshed.Endpoint.MCPAddr()
-	req2.Host = substrateHostOrDefault(t.backendKind, refreshed.ID, req2.URL.Host)
+	routeRequest(req2, refreshed.Endpoint)
 	return t.inner.RoundTrip(req2)
 }
 
@@ -171,7 +171,7 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request, sess *sessi
 	r2 := r.Clone(r.Context())
 	r2.URL.Scheme = target.Scheme
 	r2.URL.Host = target.Host
-	r2.Host = substrateHostOrDefault(h.Backend, sess.ID, target.Host)
+	routeRequest(r2, sess.Endpoint)
 	r2.RequestURI = ""
 
 	// Buffer up to maxReplayBodyBytes and set GetBody so retryingTransport can
@@ -266,9 +266,8 @@ func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request, sess *session
 	outReq := r.Clone(r.Context())
 	outReq.URL.Scheme = "http"
 	outReq.URL.Host = sess.Endpoint.Addr()
-	outReq.Host = substrateHostOrDefault(h.Backend, sess.ID, sess.Endpoint.Addr())
+	routeRequest(outReq, sess.Endpoint)
 	outReq.Header.Set("X-Forwarded-For", clientIPMust(r))
-	outReq.Header.Set("Host", outReq.Host)
 	if err := outReq.Write(backendConn); err != nil {
 		http.Error(w, fmt.Sprintf("backend write failed: %v", err), http.StatusBadGateway)
 		return
@@ -396,11 +395,11 @@ func clientIPMust(r *http.Request) string {
 	return ip
 }
 
-// substrateHostOrDefault returns the actor-routable Host header for substrate
-// or the upstream addr for everything else.
-func substrateHostOrDefault(backendKind, playwrightID, fallback string) string {
-	if backendKind == "substrate" {
-		return "pw-" + playwrightID + "." + backend.SubstrateActorHost
+func routeRequest(r *http.Request, endpoint backend.Endpoint) {
+	r.Host = r.URL.Host
+	// Never forward caller-selected actor identity to a shared router.
+	r.Header.Del("ate-target-actor")
+	if endpoint.TargetActor != "" {
+		r.Header.Set("ate-target-actor", endpoint.TargetActor)
 	}
-	return fallback
 }

@@ -39,6 +39,9 @@ spec:
               value: "ws://playwright-proxy:9000/"
             - name: PW_ID
               value: "CLIENTID"
+            - name: PW_TARGET_URL
+              value: "http://test-target.NAMESPACE.svc.cluster.local/"
+            - { name: PW_EXPECT_TEXT, value: "" }
           volumeMounts:
             - name: scripts
               mountPath: /scripts

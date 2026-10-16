@@ -9,8 +9,9 @@ RUN go mod download && go mod verify
 # Copy source and build. VERSION/COMMIT feed the playwright_build_info metric.
 ARG VERSION=dev
 ARG COMMIT=none
+ARG TARGETARCH
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath \
     -ldflags="-s -w -extldflags \"-static\" -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o /out/playwright-proxy ./cmd/playwright-proxy

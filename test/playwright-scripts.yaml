@@ -22,6 +22,7 @@ data:
     const URL    = process.env.PW_URL;
     const ID     = process.env.PW_ID || 'unknown';
     const TARGET = process.env.PW_TARGET_URL || 'http://test-target/';
+    const EXPECT_TEXT = process.env.PW_EXPECT_TEXT;
     // Retry chromium.connect on two transient conditions:
     //   1. 403 — a small window where the proxy's pod informer hasn't yet seen
     //      this pod's IP via WATCH, even though the Job is already running us.
@@ -70,7 +71,7 @@ data:
       }
       const body = await page.content();
       const m = body.match(/Hostname:\s*([^<\s]+)/);
-      if (!m) {
+      if (EXPECT_TEXT ? !body.includes(EXPECT_TEXT) : !m) {
         console.error('FAIL [' + ID + '] no Hostname in body:', body.slice(0, 200));
         process.exit(1);
       }
@@ -80,7 +81,8 @@ data:
         newPage_ms: t2 - t1,
         goto_ms:    t3 - t2,
         total_ms:   t3 - t0,
-        hostname:   m[1],
+        hostname:   m ? m[1] : null,
+        target:     TARGET,
       };
       console.log('BENCH ' + JSON.stringify(timing));
       await browser.close();

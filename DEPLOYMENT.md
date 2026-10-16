@@ -4,6 +4,8 @@ This repository includes production-ready deployment configurations for the Play
 
 ## Quick Links
 
+- **Pinned backend releases and current kind results**: [October 2026 update](docs/blog/sandbox-updates-2026-10.md)
+- **Substrate v0.5 migration**: [API resources, authentication, routing and egress](deploy/examples/substrate/README.md)
 - **Deployment Documentation**: [deploy/README.md](deploy/README.md)
 - **Docker Image**: `ghcr.io/carlossg/playwright-k8s-sandbox`
 - **CI/CD Workflow**: [.github/workflows/docker-build.yml](.github/workflows/docker-build.yml)
@@ -94,7 +96,7 @@ kubectl -n $NAMESPACE logs -l app.kubernetes.io/name=playwright-proxy
 - Pod Security Standards compliant
 - Seccomp profile (RuntimeDefault)
 - Resource limits enforced
-- Minimal RBAC permissions (namespace-scoped)
+- Namespace-scoped base RBAC; KARS and isola require the documented backend-specific permissions
 - Service account token auto-mounted only when needed
 
 ✅ **Network Security**

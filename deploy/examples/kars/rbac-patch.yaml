@@ -18,6 +18,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
+  # A separate, least-traffic ingress policy opens the BYO browser port only
+  # to proxy pods in the configured namespace; KARS' own policy is untouched.
+  # Dynamic sandbox namespaces require cluster-scoped permission.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

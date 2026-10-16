@@ -33,7 +33,7 @@ spec:
               kubernetes.io/metadata.name: PROXY_NAMESPACE
           podSelector:
             matchLabels:
-              app: playwright-proxy
+              app.kubernetes.io/name: playwright-proxy
       ports:
         - protocol: TCP
           port: SANDBOX_PORT

@@ -1,5 +1,12 @@
 # Architecture
 
+**Release update (October 2026):** see the
+[pinned release migration and kind rerun](blog/sandbox-updates-2026-10.md) for
+agent-sandbox v1.0.7, isola v0.7.0, KARS v0.1.26 and substrate v0.5.0.
+The benchmark tables below are historical measurements, not current results.
+The pre-v0.5 substrate sequence and boot workaround are retained as history
+and must not be used as deployment instructions.
+
 A per-namespace HTTP/WebSocket proxy that fronts Playwright (MCP over HTTP +
 the native Playwright WebSocket server) and routes each calling agent pod to a
 dedicated Playwright sandbox. Five backends are pluggable behind a single
@@ -118,7 +125,7 @@ Quick comparison:
 | agent-sandbox | `SandboxClaim` → warm pod | **No** — claim deleted ⇒ pod destroyed; next call gets a fresh pod | ~0.6s (warmpool is pre-warmed; main cost is the WS handshake) |
 | isola         | `Sandbox` CR → gVisor-isolated pod in a shared namespace | **No** — CR deleted (default `TerminationPolicy=Delete`) ⇒ pod destroyed; next call gets a fresh sandbox. (A `SnapshotRootfs` termination type exists in isola but is unused by this backend.) | Variable (gVisor pod cold-start + image pull; no warm pool) |
 | openshell     | `SandboxClaim` → warm pod (openshell image) | **No** — same as agent-sandbox | ~0.6s |
-| substrate     | `Actor` → gVisor sandbox on a worker pod | **Designed to**, via gVisor checkpoint/restore; **disabled here** (`SUBSTRATE_FORCE_BOOT=true`) because restore is broken in this environment | ~3.6s with boot-from-spec; would be sub-second with working snapshot restore |
+| substrate     | API `Actor` → gVisor sandbox on a worker pod | Explicit suspend/resume supports memory snapshots; `Delete`/idle reap deletes the Actor, not hibernates it | See current release measurements; no force-boot override |
 | karssandbox   | `KarsSandbox` CR → namespaced pod | **No** — CR deleted ⇒ namespace + pod destroyed; next call gets a fresh isolated sandbox | Variable (depends on KARS controller + image pull; typically similar to agent-sandbox) |
 
 Across all five, "sticky while alive" still holds: as long as the proxy's
@@ -293,8 +300,10 @@ and `allowClusterDNS` to `true` on every Sandbox it creates — a sensible
 default for a backend whose whole purpose is browsing arbitrary pages. Note
 that `allowInternetEgress` does **not** open private/cluster-internal ranges
 (isola excepts them even with internet egress on), so reaching an in-cluster
-target (e.g. a test fixture Service) additionally requires its CIDR in
-`ISOLA_ALLOWED_EGRESS_CIDRS` (optional, comma-separated; see Configuration below).
+target (e.g. a test fixture Service) requires a separate destination-scoped
+NetworkPolicy. In v0.7, `allowedEgressCIDRs` is ignored when internet egress is
+enabled and does not provide a private-network exception. The harness applies
+`test/isola-allow-test-target.yaml` for this purpose.
 
 **Configuration:**
 ```bash
@@ -302,9 +311,6 @@ BACKEND=isola
 ISOLA_NAMESPACE=isola-sandboxes                # Default; must match isola's
                                                 # Helm value sandboxNamespace.name
 ISOLA_SANDBOX_IMAGE=<your-playwright-image>    # Required: sandbox container image
-ISOLA_ALLOWED_EGRESS_CIDRS=10.0.0.0/8          # Optional: extra egress CIDRs
-                                                # beyond the default internet-egress
-                                                # allowance (see Egress note above)
 SANDBOX_PORT=9222                              # Default: application listen port
 ```
 
@@ -329,9 +335,9 @@ mandatory NetworkPolicy described above.
 
 **Testing:**
 ```bash
-# Install isola (operator + CRDs) into the existing cluster. Requires a gVisor
-# RuntimeClass on cluster nodes for real isolation — see the up-isola comments
-# in test/harness.sh for the known gVisor-in-kind limitation.
+# Install isola (operator + CRDs) into the existing cluster.
+# up-isola installs checksum-verified runsc, its
+# containerd shim/configuration, and the gvisor RuntimeClass.
 ./test/harness.sh up-isola
 
 # Run integration tests
@@ -381,21 +387,27 @@ different warm pools.
 
 ### substrate
 
-Substrate owns the data plane — `atenet-router` (Envoy + ext_proc) dispatches
-to an actor pod by `Host: <actor-id>.actors.resources.substrate.ate.dev`. The
-proxy's job is to: (a) identify the caller, (b) ensure an Actor exists and is
-RUNNING via the ate-api Control gRPC, (c) probe atenet for upstream readiness,
-(d) hand the WS upgrade off to atenet with the rewritten Host header.
+In v0.5, `atenet-router` dispatches by the trusted
+`ate-target-actor: <atespace>/<actor-name>` header. The proxy creates and resumes
+Actors using the Control gRPC API, waits for `ACTOR_STATE_RUNNING`, and probes
+the router with that same header before forwarding a WebSocket upgrade.
+Caller-supplied actor headers are stripped/overwritten on HTTP, WebSocket and
+retry paths.
 
-**State across runs:** in principle yes, via substrate's gVisor checkpoint /
-restore — a SuspendActor saves the actor's full sandbox state to S3
-(`rustfs` here) and a subsequent ResumeActor restores it. The actor lives
-across pod reschedule and across the agent's idle reaper. **In practice
-disabled here:** in this environment the restore leaves the playwright
-sub-container in `status: stopped, pid: -1`, so we force boot-from-spec via
-`SUBSTRATE_FORCE_BOOT=true` (see [Why `Boot=true`](#why-boottrue) below).
-That effectively makes substrate behave like agent-sandbox/openshell from a
-state-persistence standpoint until the upstream restore bug is fixed.
+Actors and ActorTemplates are atespace-scoped API resources, not Kubernetes
+CRDs. WorkerPools use `workerImage` and `sandboxClasses`; ActorTemplates use a
+named SandboxConfig, `wakeupProbe` and `snapshotConfig.preferredFidelity`.
+The proxy projects a token with audience `api.ate-system.svc`; its namespace
+needs the `ate.dev/api-access=true` network allowance. Neither is per-resource
+authorization. Actor egress, including DNS, requires an explicit policy.
+See the [deployment guide](../deploy/examples/substrate/README.md).
+
+**State across runs:** explicit suspend/resume can preserve a memory snapshot.
+The latest kind run successfully resumed Chromium with memory fidelity.
+The proxy's idle reaper still **deletes** actors; it is not a hibernation API.
+`SUBSTRATE_FORCE_BOOT=true` is now rejected because v0.5 removed the Boot option.
+
+**Historical, pre-v0.5 sequence (not the current API or routing contract):**
 
 ```mermaid
 sequenceDiagram
@@ -447,11 +459,11 @@ sequenceDiagram
 
 #### Why `Boot=true`
 
-Substrate's snapshot restore (both golden and per-actor) leaves the playwright
+**Historical workaround, removed in the v0.5 adapter.** The old snapshot restore left the playwright
 sub-container in `status: stopped, pid: -1` in the gVisor sandbox in this
 environment — `runsc list` confirms the pause container runs but the
-`node /server.js` process never reattaches. Boot-from-spec is reliable and we
-turn it on with `SUBSTRATE_FORCE_BOOT=true`. The substrate-side companion fix
+`node /server.js` process never reattached. We previously enabled boot-from-spec
+with `SUBSTRATE_FORCE_BOOT=true`. The historical substrate-side companion fix
 (local commits `c4338f8 fix(atenet): enable WebSocket upgrades in HCM` +
 `caa2158 fix(resume): honor Boot=true for per-actor snapshot, propagate via
 atenet`) makes Boot=true bypass the per-actor snapshot path and propagates it
@@ -465,9 +477,9 @@ sentry has accepted the restore request. With those flags the sandbox lazily
 pages in memory and the in-sandbox Node process is not yet bound to port 80
 when `STATUS_RUNNING` is reported. atenet would forward the WS upgrade
 immediately, get a `connect 111 refused`, and return 503 to the client. The
-proxy's `waitUpstreamReady` runs HEAD probes against atenet (re-using the same
-Host header it will use for the real upgrade) until atenet stops returning
-503, so the client only sees latency.
+proxy's `waitUpstreamReady` runs HEAD probes against atenet with the trusted
+actor-routing header until the upstream responds successfully. Failure to
+become ready is now an error, not a success-shaped endpoint.
 
 ### KarsSandbox
 
@@ -475,6 +487,11 @@ One `KarsSandbox` custom resource (CR) per `playwright-id`, using Azure's KARS
 (Kubernetes Azure Runtime Sandboxes) controller. The KARS controller provisions
 an isolated namespace per sandbox and creates the sandbox pod within it. The
 proxy polls `status.phase=Running`, then locates the pod IP via the CoreV1 API.
+It waits for actual Pod readiness and creates a separate ingress policy
+allowing only the proxy namespace/pod selector to reach the browser port.
+The generated KARS Service exposes inference, not the BYO browser port.
+KARS' egress guard and private-address blocking remain enabled; this matters
+when choosing a browser test target.
 
 **State across runs:** none. A KarsSandbox CR creates a dedicated namespace
 and pod; when the CR is deleted (idle reap, or `Delete(id)`) both the namespace
@@ -505,7 +522,7 @@ sequenceDiagram
 
     P->>K: GET KarsSandbox pw-delta
     K-->>P: 404 NotFound
-    P->>K: POST KarsSandbox pw-delta<br/>spec.runtime=BYO<br/>spec.image=playwright-image<br/>inferenceRef=ai-policy (optional)
+    P->>K: POST KarsSandbox pw-delta<br/>spec.runtime=BYO<br/>spec.image=playwright-image<br/>inferenceRef=ai-policy
     K-->>P: 201 Created
 
     Note over KC: KarsSandbox reconcile
@@ -565,6 +582,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list"]  # To locate pod IP after KarsSandbox is Running
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "create"]  # Browser ingress in dynamic sandbox namespaces
 ```
 
 See `deploy/examples/kars/` for complete deployment manifests including
@@ -587,17 +607,17 @@ proxy configuration, RBAC patches, and InferencePolicy examples.
 
 ## Bench harness and results
 
-`proxy/test/bench.sh` exercises three scenarios per backend (note: KARS and
-isola backend benchmarks are available but results not yet included in the
-table below):
+`test/bench.sh` exercises three scenarios per backend. The table below is
+historical; see the [release-upgrade results](blog/sandbox-updates-2026-10.md)
+for the current four-backend rerun, including the KARS limitation.
 
 | Scenario   | What it measures |
 |------------|------------------|
 | `cold`     | First request after the prior session is wiped: full Ensure (CreateActor + ResumeActor + readiness probe for substrate; CreateClaim + bind for sandboxclaim). |
 | `warm`     | Second request reusing the cached session: just the proxy hop + WS upgrade. |
-| `restore`  | Out-of-band suspend then a fresh request. For sandboxclaim this re-creates the claim (== cold). For substrate it forces boot-from-spec with the proxy's session cache invalidated by a rollout restart. |
+| `restore`  | Delete/recreate for sandboxclaim, isola and KARS. For substrate: restart the proxy first, suspend and verify the actor, then measure request-triggered resume. |
 
-The bench's Playwright client (`proxy/test/playwright-scripts.yaml`) emits a
+The bench's Playwright client (`test/playwright-scripts.yaml`) emits a
 single `BENCH {…}` JSON line with per-phase timings:
 
 - `connect_ms` — `chromium.connect(wsEndpoint)` round-trip (includes
@@ -608,7 +628,8 @@ single `BENCH {…}` JSON line with per-phase timings:
 
 ### Results
 
-Run on Colima 16 GiB / 6 CPU, kind 1.33, arm64. All nine scenarios pass.
+Historical run on Colima 16 GiB / 6 CPU, kind 1.33, arm64. All nine scenarios
+passed in that older setup. These are not v0.5 restore measurements.
 
 | backend       | scenario | result | connect_ms | newPage_ms | goto_ms | total_ms |
 |---------------|----------|--------|-----------:|-----------:|--------:|---------:|
@@ -646,22 +667,24 @@ Reading the numbers:
 ```sh
 # Bring up all kind clusters (one-time per machine)
 ./test/harness.sh up                            # 'playwright-proxy' cluster for sandboxclaim
-( cd substrate && hack/create-kind-cluster.sh \
-    && hack/install-ate-kind.sh --deploy-ate-system ) # 'kind' cluster for substrate
+./test/harness.sh e2e                           # browser WS + MCP, agent-sandbox
+./test/harness.sh up-substrate                  # pinned substrate release, 'kind' cluster
+./test/harness.sh test substrate                # browser worker + API template
 ./test/harness.sh up-kars                       # KARS cluster with controller
+./test/harness.sh test kars                     # records the known private-fixture failure
 ./test/harness.sh up-isola                      # isola cluster with operator (gVisor RuntimeClass)
+./test/harness.sh test isola
 
 # Run the full bench
-./test/bench.sh all                             # agent-sandbox + openshell + substrate + kars + isola
+./test/bench.sh agent-sandbox
 ./test/bench.sh substrate                       # substrate only
 ./test/bench.sh kars                            # KARS only
 ./test/bench.sh isola                           # isola only
 ```
 
-`bench.sh` does a `kubectl-ate admin debug-flush-redis` and a worker recycle
-between full runs to keep results comparable; if you skip those, expect
-slightly faster cold numbers on substrate because the prior actor's OCI
-bundle is still warm in `/run/ateom-gvisor`.
+The current harness does not flush storage caches or recycle workers between
+measurements. Images and worker-side bundles may remain cached; current
+release results must be interpreted with that limitation.
 
 ## Caveats
 
@@ -676,7 +699,5 @@ bundle is still warm in `/run/ateom-gvisor`.
   constraint — `metadata.name` is capped at 47 chars — so `internal/backend/isola.go`'s
   `isolaName` hashes into the CR name itself when `"pw-" + id` would exceed it
   (see the [isola](#isola) section).
-- The substrate workaround keeps `SUBSTRATE_FORCE_BOOT=true` on by default in
-  `proxy/test/proxy-substrate.yaml`. Once substrate's snapshot restore is
-  fixed upstream, flip it back to `false` to get sub-second cold-starts via
-  golden snapshot.
+- Substrate v0.5 rejects `SUBSTRATE_FORCE_BOOT=true`; the old workaround is
+  historical only. Configure snapshot fidelity on the API ActorTemplate.

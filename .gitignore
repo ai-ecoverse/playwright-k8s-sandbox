@@ -3,6 +3,7 @@
 /OpenShell
 /substrate
 /kars
+/.backend-sources/
 
 # Logs
 *.log

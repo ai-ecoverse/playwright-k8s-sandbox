@@ -44,8 +44,7 @@ spec:
             - name: PORT
               value: "9222"
             - name: CHROMIUM_ARGS
-              # --single-process is needed under gVisor (substrate) but breaks
-              # newPage under regular containerd; drop it here.
+              # Keep Chromium multiprocess for reliable context reuse.
               value: "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu"
           ports:
             - name: playwright

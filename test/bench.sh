@@ -4,7 +4,7 @@
 # Scenarios:
 #   cold     — no Playwright runtime exists for the playwright-id; first request
 #              has to provision it (sandboxclaim → claim+sandbox, substrate →
-#              CreateActor + restore-from-golden, kars → KarsSandbox CR create +
+#              CreateActor + boot (golden snapshot disabled), kars → KarsSandbox CR create +
 #              controller reconcile + pod schedule + Chromium start, isola →
 #              Sandbox CR create + operator reconcile + gVisor pod start)
 #   warm     — runtime already exists for the id; just connect+fetch
@@ -29,12 +29,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
 SLIM_IMAGE_TAG="localhost:5001/playwright-substrate:slim-1.53.0"
-KARS_CLUSTER="${KARS_CLUSTER:-kars-playwright}"
+CLUSTER="${CLUSTER:-playwright-proxy}"
+KARS_CLUSTER="${KARS_CLUSTER:-$CLUSTER}"
 KARS_NS="${KARS_NS:-pw-kars}"
-ISOLA_CLUSTER="${ISOLA_CLUSTER:-isola-playwright}"
+ISOLA_CLUSTER="${ISOLA_CLUSTER:-$CLUSTER}"
 ISOLA_NS="${ISOLA_NS:-pw-isola}"
 ISOLA_SANDBOX_NS="${ISOLA_SANDBOX_NS:-isola-sandboxes}"
 RESULTS_FILE="${RESULTS_FILE:-/tmp/bench-results.csv}"
+SUBSTRATE_CLUSTER="${SUBSTRATE_CLUSTER:-kind}"
+SUBSTRATE_NS="${SUBSTRATE_NS:-pw-substrate}"
+KUBECTL_ATE="${KUBECTL_ATE:-kubectl-ate}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarn\033[0m %s\n' "$*" >&2; }
@@ -165,9 +169,8 @@ record() {
 
 # ---------------- sandboxclaim (agent-sandbox + openshell) -----------------
 
-# Wipe any prior session+sandbox so the next client triggers a cold provision.
 # Ensure a labelled probe pod exists in $ns; used by wait_for_proxy_ready as
-# an end-to-end "is the data plane actually serving labelled clients" gate.
+# a management-readiness gate without provisioning a sandbox.
 ensure_labelled_probe_pod() {
   local ns=$1 ctx=$2
   if ! kubectl --context "$ctx" -n "$ns" get pod bench-probe >/dev/null 2>&1; then
@@ -198,17 +201,14 @@ EOF
 wait_for_proxy_ready() {
   local ns=$1 ctx=$2
   ensure_labelled_probe_pod "$ns" "$ctx"
-  local end=$(($(date +%s) + 60)) code=000
+  local end=$(($(date +%s) + 60)) code=000 ip
   while [ "$(date +%s)" -lt "$end" ]; do
+    ip=$(kubectl --context "$ctx" -n "$ns" get pods -l app.kubernetes.io/name=playwright-proxy \
+      --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')
     code=$(kubectl --context "$ctx" -n "$ns" exec bench-probe -- \
       curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
-      http://playwright-proxy:9000/__bench_probe 2>/dev/null || echo 000)
-    case "$code" in
-      000|403) ;;              # not ready: TCP failed (kube-proxy stale) or
-                               # informer hasn't seen this probe pod yet
-      *) return 0 ;;           # any HTTP response (200/502/503/504) → proxy
-                               # identified us and the data path is up
-    esac
+      "http://$ip:9090/readyz" 2>/dev/null || echo 000)
+    [ "$code" = 200 ] && return 0
     sleep 1
   done
   warn "proxy in $ns never became ready (last http_code=$code)"
@@ -252,7 +252,7 @@ bench_sandboxclaim() {
   ensure_labelled_probe_pod "$ns" "$ctx"
   log "[$backend] deploying proxy (WARMPOOL_NAME=$warmpool, SANDBOX_PORT=9222)"
   sed -e "s|namespace: NAMESPACE|namespace: $ns|g" \
-      -e "s|ghcr.io/carlossg/playwright-k8s-sandbox/proxy:latest|playwright-proxy:dev|g" \
+      -e "s|image: ghcr.io/carlossg/playwright-k8s-sandbox.*|image: playwright-proxy:dev|" \
       -e "s|value: \"playwright\"        # agent-sandbox SandboxWarmPool name|value: \"$warmpool\"|g" \
       -e "s|value: \"9222\"              # Playwright server / MCP port|value: \"9222\"|g" \
       -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
@@ -300,40 +300,41 @@ bench_sandboxclaim() {
 # --------------------------- substrate -------------------------------------
 
 wipe_substrate_actor() {
-  local id=$1
-  kubectl-ate --context kind-kind suspend actor "pw-$id" 2>/dev/null | head -1 || true
-  sleep 3
-  kubectl-ate --context kind-kind delete actor "pw-$id" 2>/dev/null | head -1 || true
-  kubectl --context kind-kind -n pw-substrate rollout restart deploy/playwright-proxy >/dev/null 2>&1 || true
-  kubectl --context kind-kind -n pw-substrate rollout status deploy/playwright-proxy --timeout=60s >/dev/null
-  wait_for_proxy_ready pw-substrate kind-kind
+  local id=$1 existing ctx="kind-$SUBSTRATE_CLUSTER"
+  if existing=$("$KUBECTL_ATE" --context "$ctx" get actor "pw-$id" -a "$SUBSTRATE_NS" 2>&1); then
+    suspend_substrate_actor "$id"
+    "$KUBECTL_ATE" --context "$ctx" delete actor "pw-$id" -a "$SUBSTRATE_NS"
+  elif ! printf '%s' "$existing" | grep -q NotFound; then
+    fail "$existing"
+  fi
+  kubectl --context "$ctx" -n "$SUBSTRATE_NS" rollout restart deploy/playwright-proxy >/dev/null
+  kubectl --context "$ctx" -n "$SUBSTRATE_NS" rollout status deploy/playwright-proxy --timeout=120s >/dev/null
+  wait_for_proxy_ready "$SUBSTRATE_NS" "$ctx"
 }
 
 suspend_substrate_actor() {
-  local id=$1
-  kubectl-ate --context kind-kind suspend actor "pw-$id" 2>/dev/null | head -1 || true
+  local id=$1 ctx="kind-$SUBSTRATE_CLUSTER" st
+  # Startup reconciliation resumes existing actors. Restart BEFORE suspending
+  # so the timed request, not the restart, triggers atenet's automatic resume.
+  kubectl --context "$ctx" -n "$SUBSTRATE_NS" rollout restart deploy/playwright-proxy >/dev/null || return 1
+  kubectl --context "$ctx" -n "$SUBSTRATE_NS" rollout status deploy/playwright-proxy --timeout=120s >/dev/null || return 1
+  wait_for_proxy_ready "$SUBSTRATE_NS" "$ctx" || return 1
+  "$KUBECTL_ATE" --context "$ctx" suspend actor "pw-$id" -a "$SUBSTRATE_NS" || return 1
   # Wait for actor to actually be SUSPENDED
   for _ in $(seq 1 30); do
-    local st
-    st=$(kubectl-ate --context kind-kind get actor "pw-$id" 2>/dev/null | awk 'NR==2 {print $4}')
-    [ "$st" = STATUS_SUSPENDED ] && break
+    st=$("$KUBECTL_ATE" --context "$ctx" get actor "pw-$id" -a "$SUBSTRATE_NS" -o json \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["state"])') || return 1
+    [ "$st" = ACTOR_STATE_SUSPENDED ] && break
     sleep 2
   done
-  if [ "$st" != STATUS_SUSPENDED ]; then
-    warn "[substrate] actor pw-$id did not reach STATUS_SUSPENDED"
+  if [ "$st" != ACTOR_STATE_SUSPENDED ]; then
+    warn "[substrate] actor pw-$id did not reach ACTOR_STATE_SUSPENDED"
     return 1
   fi
-  # Out-of-band suspend leaves the proxy with a stale cached session — restart
-  # it so the next request re-Ensures (calls ResumeActor + the upstream
-  # readiness probe) instead of forwarding to atenet against a not-yet-ready
-  # upstream.
-  kubectl --context kind-kind -n pw-substrate rollout restart deploy/playwright-proxy >/dev/null 2>&1 || true
-  kubectl --context kind-kind -n pw-substrate rollout status  deploy/playwright-proxy --timeout=120s >/dev/null
-  wait_for_proxy_ready pw-substrate kind-kind
 }
 
 bench_substrate() {
-  local ns=pw-substrate ctx=kind-kind cluster=kind
+  local ns="$SUBSTRATE_NS" ctx="kind-$SUBSTRATE_CLUSTER" cluster="$SUBSTRATE_CLUSTER"
   local id="bench-substrate"
   log "[substrate] preparing"
   ensure_image_in_cluster "$cluster"
@@ -347,7 +348,7 @@ bench_substrate() {
   log "[substrate cold] wiping prior actor"
   wipe_substrate_actor "$id"
   log "[substrate cold] running client"
-  if out=$(run_client substrate cold "$ns" "$ctx" "$id" "http://test-target/" 180); then
+  if out=$(run_client substrate cold "$ns" "$ctx" "$id" "http://test-target.$ns.svc.cluster.local/" 180); then
     record substrate cold PASS "${out#BENCH }"
     log "[substrate cold] $out"
   else
@@ -356,7 +357,7 @@ bench_substrate() {
 
   # warm
   log "[substrate warm] running client"
-  if out=$(run_client substrate warm "$ns" "$ctx" "$id" "http://test-target/" 60); then
+  if out=$(run_client substrate warm "$ns" "$ctx" "$id" "http://test-target.$ns.svc.cluster.local/" 60); then
     record substrate warm PASS "${out#BENCH }"
     log "[substrate warm] $out"
   else
@@ -367,7 +368,7 @@ bench_substrate() {
   log "[substrate restore] suspending actor"
   if suspend_substrate_actor "$id"; then
     log "[substrate restore] running client (should restore from per-actor snapshot)"
-    if out=$(run_client substrate restore "$ns" "$ctx" "$id" "http://test-target/" 180); then
+    if out=$(run_client substrate restore "$ns" "$ctx" "$id" "http://test-target.$ns.svc.cluster.local/" 180); then
       record substrate restore PASS "${out#BENCH }"
       log "[substrate restore] $out"
     else
@@ -406,14 +407,14 @@ wipe_karssandbox() {
 }
 
 bench_kars() {
-  local ctx="--context=kind-$KARS_CLUSTER"
+  local ctx="kind-$KARS_CLUSTER"
   local ns="$KARS_NS"
   local id="bench-kars"
 
   log "[kars] preparing (cluster=$KARS_CLUSTER, ns=$ns)"
 
   # The kars cluster must already be up (harness.sh up-kars). Verify it.
-  if ! kubectl $ctx get ns kars-system >/dev/null 2>&1; then
+  if ! kubectl --context "$ctx" get ns kars-system >/dev/null 2>&1; then
     warn "[kars] kars-system namespace not found in cluster '$KARS_CLUSTER'"
     warn "       Run: ./harness.sh up-kars"
     record kars cold  FAIL "{}"
@@ -430,9 +431,9 @@ bench_kars() {
   sed -e "s|namespace: NAMESPACE|namespace: $ns|g" \
       -e "s|PROXY_IMAGE|playwright-proxy:dev|g" \
       -e "s|PLAYWRIGHT_IMAGE|$SLIM_IMAGE_TAG|g" \
-      "$HERE/proxy-kars.yaml" | kubectl $ctx apply -f - >/dev/null
-  kubectl $ctx -n "$ns" rollout restart deploy/playwright-proxy >/dev/null 2>&1 || true
-  kubectl $ctx -n "$ns" rollout status  deploy/playwright-proxy --timeout=120s >/dev/null
+      "$HERE/proxy-kars.yaml" | kubectl --context "$ctx" apply -f - >/dev/null
+  kubectl --context "$ctx" -n "$ns" rollout restart deploy/playwright-proxy >/dev/null
+  kubectl --context "$ctx" -n "$ns" rollout status deploy/playwright-proxy --timeout=120s >/dev/null
 
   # kars cold starts are slow (no warmpool; namespace + pod + Chromium). Give
   # the bench client 300s — well above the 180s ENSURE_TIMEOUT on the proxy.
@@ -483,12 +484,12 @@ wipe_isola_sandbox() {
   local ns=$1 ctx=$2 id=$3
   local cr="pw-$id"
 
-  kubectl --context "$ctx" -n "$ISOLA_SANDBOX_NS" delete sandbox "$cr" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$ctx" -n "$ISOLA_SANDBOX_NS" delete sandboxes.sandbox.isola.run "$cr" --ignore-not-found >/dev/null
 
   # Wait for the operator to finish deleting the sandbox pod (up to 60s).
   local end=$(($(date +%s) + 60))
   while [ "$(date +%s)" -lt "$end" ]; do
-    if ! kubectl --context "$ctx" get sandbox -n "$ISOLA_SANDBOX_NS" "$cr" >/dev/null 2>&1; then
+    if ! kubectl --context "$ctx" get sandboxes.sandbox.isola.run -n "$ISOLA_SANDBOX_NS" "$cr" >/dev/null 2>&1; then
       break
     fi
     sleep 2
@@ -501,14 +502,14 @@ wipe_isola_sandbox() {
 }
 
 bench_isola() {
-  local ctx="--context=kind-$ISOLA_CLUSTER"
+  local ctx="kind-$ISOLA_CLUSTER"
   local ns="$ISOLA_NS"
   local id="bench-isola"
 
   log "[isola] preparing (cluster=$ISOLA_CLUSTER, ns=$ns, sandbox-ns=$ISOLA_SANDBOX_NS)"
 
   # The isola cluster must already be up (harness.sh up-isola). Verify it.
-  if ! kubectl $ctx get ns "$ISOLA_SANDBOX_NS" >/dev/null 2>&1; then
+  if ! kubectl --context "$ctx" get ns "$ISOLA_SANDBOX_NS" >/dev/null 2>&1; then
     warn "[isola] $ISOLA_SANDBOX_NS namespace not found in cluster '$ISOLA_CLUSTER'"
     warn "        Run: ./harness.sh up-isola"
     record isola cold  FAIL "{}"
@@ -525,9 +526,9 @@ bench_isola() {
   sed -e "s|namespace: NAMESPACE|namespace: $ns|g" \
       -e "s|PROXY_IMAGE|playwright-proxy:dev|g" \
       -e "s|PLAYWRIGHT_IMAGE|$SLIM_IMAGE_TAG|g" \
-      "$HERE/proxy-isola.yaml" | kubectl $ctx apply -f - >/dev/null
-  kubectl $ctx -n "$ns" rollout restart deploy/playwright-proxy >/dev/null 2>&1 || true
-  kubectl $ctx -n "$ns" rollout status  deploy/playwright-proxy --timeout=120s >/dev/null
+      "$HERE/proxy-isola.yaml" | kubectl --context "$ctx" apply -f - >/dev/null
+  kubectl --context "$ctx" -n "$ns" rollout restart deploy/playwright-proxy >/dev/null
+  kubectl --context "$ctx" -n "$ns" rollout status deploy/playwright-proxy --timeout=120s >/dev/null
 
   # isola cold starts are slow (no warmpool; CR reconcile + gVisor pod +
   # Chromium). Give the bench client 300s — well above the 180s ENSURE_TIMEOUT
@@ -605,6 +606,9 @@ main() {
     *) fail "usage: $0 {agent-sandbox|openshell|substrate|kars|isola|all}" ;;
   esac
   print_table
+  if grep -q ',FAIL,' "$RESULTS_FILE"; then
+    return 1
+  fi
 }
 
 main "$@"

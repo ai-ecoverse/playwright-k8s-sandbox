@@ -43,9 +43,8 @@ spec:
             - name: MCP_PORT
               value: "9223"
             - name: CHROMIUM_ARGS
-              # --single-process is required under gVisor (substrate) but breaks
-              # browserContext.newPage() under regular containerd because the
-              # renderer can't fork; drop it for agent-sandbox/openshell.
+              # Keep Chromium multiprocess; --single-process breaks newPage
+              # reuse and is no longer required by the tested gVisor runtime.
               value: "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu"
           ports:
             - name: playwright

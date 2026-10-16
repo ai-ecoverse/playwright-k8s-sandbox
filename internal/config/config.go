@@ -54,15 +54,16 @@ type Config struct {
 	// Typically "atenet-router.ate-system.svc.cluster.local:80".
 	SubstrateRouterAddr string
 
-	// SubstrateActorTemplate is "namespace/name" of an ActorTemplate (substrate backend only).
+	// SubstrateActorTemplate is "atespace/name" of an ActorTemplate (substrate backend only).
 	SubstrateActorTemplate string
 
-	// SubstrateForceBoot, when true, passes Boot=true to substrate's ResumeActor
-	// so it boots from the ActorTemplate spec instead of restoring from a
-	// snapshot. Workaround for substrate environments where snapshot restore is
-	// unreliable (e.g. when checkpoint pause + restore pause/sub-container
-	// leaves the app sub-container in `stopped` state).
+	// SubstrateForceBoot is a legacy setting, rejected for substrate v0.5+.
 	SubstrateForceBoot bool
+
+	// SubstrateAllowedHTTPHosts optionally manages each actor's default egress
+	// policy, allowing cleartext HTTP on port 80 to these hostnames only.
+	// Empty leaves policy management to the operator (default deny upstream).
+	SubstrateAllowedHTTPHosts []string
 
 	// KarsInferenceRef is the name of the InferencePolicy CR in the proxy
 	// namespace that each Playwright KarsSandbox references. Required for
@@ -84,10 +85,9 @@ type Config struct {
 	// isola Sandbox CRs. Required for the isola backend.
 	IsolaSandboxImage string
 
-	// IsolaAllowedEgressCIDRs are additional CIDRs isola sandboxes may reach,
-	// beyond the default internet-egress allowance (which excepts private/
-	// cluster-internal ranges). Only needed to let the sandbox reach an
-	// in-cluster target (e.g. a test fixture Service). Optional.
+	// IsolaAllowedEgressCIDRs are passed through to isola. In v0.7 these are
+	// ignored when allowInternetEgress is true; private cluster destinations
+	// require an additional operator-managed NetworkPolicy.
 	IsolaAllowedEgressCIDRs []string
 
 	// IdleTTL is how long a session must be idle (no traffic AND no open connections) before reaping.
@@ -117,6 +117,16 @@ func FromEnv() (*Config, error) {
 		KarsSandboxImage:       os.Getenv("KARS_SANDBOX_IMAGE"),
 		IsolaNamespace:         envOr("ISOLA_NAMESPACE", "isola-sandboxes"),
 		IsolaSandboxImage:      os.Getenv("ISOLA_SANDBOX_IMAGE"),
+	}
+
+	if v := os.Getenv("SUBSTRATE_ALLOWED_HTTP_HOSTS"); v != "" {
+		for part := range strings.SplitSeq(v, ",") {
+			host := strings.TrimSpace(part)
+			if host == "" || strings.ContainsAny(host, "/: \t\r\n") {
+				return nil, fmt.Errorf("SUBSTRATE_ALLOWED_HTTP_HOSTS: invalid hostname %q", host)
+			}
+			c.SubstrateAllowedHTTPHosts = append(c.SubstrateAllowedHTTPHosts, host)
+		}
 	}
 
 	if v := os.Getenv("ISOLA_ALLOWED_EGRESS_CIDRS"); v != "" {
@@ -167,10 +177,10 @@ func FromEnv() (*Config, error) {
 		}
 	case "substrate":
 		if c.SubstrateActorTemplate == "" {
-			return nil, fmt.Errorf("SUBSTRATE_ACTOR_TEMPLATE (namespace/name) is required for substrate backend")
+			return nil, fmt.Errorf("SUBSTRATE_ACTOR_TEMPLATE (atespace/name) is required for substrate backend")
 		}
 		if !strings.Contains(c.SubstrateActorTemplate, "/") {
-			return nil, fmt.Errorf("SUBSTRATE_ACTOR_TEMPLATE must be 'namespace/name', got %q", c.SubstrateActorTemplate)
+			return nil, fmt.Errorf("SUBSTRATE_ACTOR_TEMPLATE must be 'atespace/name', got %q", c.SubstrateActorTemplate)
 		}
 	case "karssandbox":
 		if c.KarsInferenceRef == "" {

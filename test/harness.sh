@@ -6,9 +6,10 @@
 #   ./harness.sh e2e             Real Playwright e2e: spins up the real image, drives a browser
 #                                through the proxy with the Playwright Node SDK.
 #   ./harness.sh down            Delete kind cluster.
-#   ./harness.sh up-kars         Create kars kind cluster, build+install kars controller.
+#   ./harness.sh up-kars         Install the pinned KARS release into kind.
 #   ./harness.sh down-kars       Delete kars kind cluster.
 #   ./harness.sh up-isola        Install isola (operator + CRDs) into the existing cluster.
+#   ./harness.sh up-substrate    Create substrate kind cluster and install the pinned control plane.
 #   ./harness.sh down-isola      Uninstall isola from the cluster.
 #
 # Smoke test substitutes a lightweight `traefik/whoami` container for Playwright; the
@@ -17,22 +18,24 @@
 #
 # The kars and isola backend tests run a full Playwright e2e (not echo/whoami) because
 # their sandbox specs are built around the Playwright image. kars requires the kars
-# cluster to be up (./harness.sh up-kars) and the kars repo accessible at KARS_REPO;
-# isola requires ./harness.sh up-isola and a gVisor RuntimeClass on cluster nodes (see
-# the up-isola KNOWN LIMITATION note below re: gVisor-in-kind).
+# cluster to be up (./harness.sh up-kars). Pinned source checkouts are cached in
+# .backend-sources; up-isola installs both gVisor binaries and the RuntimeClass.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 CLUSTER="${CLUSTER:-playwright-proxy}"
 NAMESPACE="${NAMESPACE:-pw-test}"
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.4}"
+source "$HERE/versions.env"
 PROXY_IMAGE="${PROXY_IMAGE:-playwright-proxy:dev}"
 
+# Explicit backend contexts below override this default; never depend on the
+# user's current context (substrate installs into a second cluster).
+kubectl() { command kubectl --context "kind-$CLUSTER" "$@"; }
+
 # ── kars-specific variables ────────────────────────────────────────────────────
-# KARS_REPO: path to the kars source tree. Defaults to the `kars` symlink at the
-# repo root (ln -s /path/to/azure/kars kars). Override if your layout differs.
-KARS_REPO="${KARS_REPO:-$ROOT/kars}"
+# KARS_REPO can override the cached, pinned source checkout.
+KARS_REPO="${KARS_REPO:-$ROOT/.backend-sources/kars/$KARS_VERSION}"
 # Reuse the same kind cluster as agent-sandbox: kars installs into kars-system
 # alongside agent-sandbox, and the kars test uses a separate namespace (pw-kars).
 # This avoids spinning up a third kind node container when Docker resources are
@@ -60,14 +63,25 @@ ISOLA_NS="${ISOLA_NS:-pw-isola}"
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 
+ensure_source() {
+  local repo=$1 version=$2 path=$3
+  if [ ! -d "$path" ]; then
+    mkdir -p "$(dirname "$path")"
+    git clone --quiet --depth 1 --branch "$version" "https://github.com/$repo.git" "$path"
+  fi
+  local expected actual
+  expected=$(git -C "$path" rev-parse "$version^{commit}")
+  actual=$(git -C "$path" rev-parse HEAD)
+  [ "$actual" = "$expected" ] || fail "$path is not at $version; use a clean checkout of the pinned release"
+}
+
 cmd_up() {
   log "creating kind cluster '$CLUSTER'"
   if ! kind get clusters | grep -qx "$CLUSTER"; then
-    kind create cluster --config "$HERE/kind-config.yaml" --wait 120s
+    kind create cluster --name "$CLUSTER" --config "$HERE/kind-config.yaml" --wait 120s
   else
     log "cluster '$CLUSTER' already exists; reusing"
   fi
-  kubectl config use-context "kind-$CLUSTER" >/dev/null
 
   log "installing agent-sandbox $AGENT_SANDBOX_VERSION"
   # v0.5.2 renamed the core release asset from manifest.yaml to sandbox.yaml
@@ -410,15 +424,11 @@ cmd_e2e() {
   sed "s/NAMESPACE/$NAMESPACE/g" "$HERE/test-target.yaml" | kubectl apply -f -
   kubectl -n "$NAMESPACE" rollout status deploy/test-target --timeout=60s
 
-  log "building slim Playwright image $PLAYWRIGHT_IMAGE (shared by all three backends)"
-  # Build from the same Dockerfile/server.js the substrate flavour uses. The
-  # Dockerfile expects ./server.js relative to the build context, so copy the
-  # versioned playwright-substrate-server.js in place for the build then drop it.
-  cp "$HERE/playwright-substrate-server.js" "$HERE/server.js"
+  log "building slim Playwright image $PLAYWRIGHT_IMAGE (shared by the sandbox backends)"
+  # The shared Dockerfile copies playwright-substrate-server.js to /server.js.
   docker build --platform "linux/$(go env GOARCH)" \
     -t "$PLAYWRIGHT_IMAGE" \
     -f "$HERE/playwright-substrate.Dockerfile" "$HERE" >/dev/null
-  rm -f "$HERE/server.js"
   log "loading $PLAYWRIGHT_IMAGE into kind via docker save (matches the substrate flavour's load path)"
   docker save "$PLAYWRIGHT_IMAGE" | docker exec -i "$CLUSTER-control-plane" ctr --namespace=k8s.io images import --no-unpack -
   docker exec "$CLUSTER-control-plane" ctr --namespace=k8s.io images ls -q | grep -q "$PLAYWRIGHT_IMAGE" \
@@ -497,6 +507,20 @@ EOF
 }
 
 build_kars_images() {
+  if [ "${KARS_BUILD_FROM_SOURCE:-false}" != true ]; then
+    log "loading published KARS $KARS_VERSION images"
+    local controller="${KARS_CONTROLLER_IMAGE_SRC:-ghcr.io/azure/kars-controller:$KARS_VERSION}"
+    local router="${KARS_ROUTER_IMAGE_SRC:-ghcr.io/azure/kars-inference-router:$KARS_VERSION}"
+    docker pull "$controller"
+    docker pull "$router"
+    docker tag "$controller" "$KARS_CONTROLLER_IMAGE"
+    docker tag "$router" "$KARS_ROUTER_IMAGE"
+    for image in "$KARS_CONTROLLER_IMAGE" "$KARS_ROUTER_IMAGE"; do
+      docker save "$image" | docker exec -i "$KARS_CLUSTER-control-plane" \
+        ctr --namespace=k8s.io images import --no-unpack -
+    done
+    return
+  fi
   # ── Fast path: pre-built images ──────────────────────────────────────────
   # If KARS_CONTROLLER_IMAGE_SRC and KARS_ROUTER_IMAGE_SRC are set, retag them
   # into the harness tags and load into kind — no compilation required. This is
@@ -592,6 +616,9 @@ install_kars_helm() {
     --set inferenceRouter.image.repository=kars-inference-router \
     --set inferenceRouter.image.tag=e2e-pw \
     --set inferenceRouter.image.pullPolicy=Never \
+    --set sandbox.image.repository=ghcr.io/azure/openclaw-sandbox \
+    --set sandbox.image.tag="$KARS_VERSION" \
+    --set meshPeer.enabled=false \
     --set-string "inferenceRouter.azure.openai.endpoint=https://e2e-fake.invalid/" \
     --set-string "foundry.endpoint=https://e2e-fake.invalid/" \
     --set-string "foundry.projectEndpoint=https://e2e-fake.invalid/" \
@@ -602,6 +629,7 @@ install_kars_helm() {
 }
 
 cmd_up_kars() {
+  ensure_source Azure/kars "$KARS_VERSION" "$KARS_REPO"
   require_kars_repo
 
   # Require the cluster to exist. The kars backend test runs inside the same
@@ -627,11 +655,9 @@ cmd_up_kars() {
   kind load docker-image "$PROXY_IMAGE" --name "$KARS_CLUSTER"
 
   log "building Playwright image $PLAYWRIGHT_IMAGE"
-  cp "$HERE/playwright-substrate-server.js" "$HERE/server.js"
   docker build --platform "linux/$(go env GOARCH)" \
     -t "$PLAYWRIGHT_IMAGE" \
     -f "$HERE/playwright-substrate.Dockerfile" "$HERE" >/dev/null
-  rm -f "$HERE/server.js"
   log "loading $PLAYWRIGHT_IMAGE into kars cluster"
   docker save "$PLAYWRIGHT_IMAGE" \
     | docker exec -i "$KARS_CLUSTER-control-plane" \
@@ -650,6 +676,9 @@ cmd_up_kars() {
   log "applying InferencePolicy"
   sed "s/NAMESPACE/$KARS_NS/g" "$ROOT/deploy/examples/kars/inferencepolicy.yaml" \
     | kubectl $(kars_ctx) apply -f -
+  log "installing the release's default ToolPolicy in the sandbox CR namespace"
+  helm template kars "$KARS_REPO/deploy/helm/kars" --namespace "$KARS_NS" \
+    --show-only templates/toolpolicy-default.yaml | kubectl $(kars_ctx) apply -f -
 
   log "applying playwright scripts ConfigMap"
   sed "s/NAMESPACE/$KARS_NS/g" "$HERE/playwright-scripts.yaml" \
@@ -679,10 +708,13 @@ cmd_test_kars() {
   # race the job timeout.
   local deadline=300
 
+  sed "s/NAMESPACE/$ns/g" "$HERE/playwright-scripts.yaml" | kubectl $ctx apply -f -
   for id in alpha beta; do
     kubectl $ctx -n "$ns" delete job "playwright-e2e-$id" --ignore-not-found --wait=true >/dev/null
     sed -e "s/NAMESPACE/$ns/g" -e "s/CLIENTID/$id/g" \
       -e "s|image: PLAYWRIGHT_IMAGE|image: $PLAYWRIGHT_IMAGE|" \
+      -e "s|http://test-target.$ns.svc.cluster.local/|${KARS_TARGET_URL:-http://test-target.$ns.svc.cluster.local/}|" \
+      -e "s|name: PW_EXPECT_TEXT, value: \"\"|name: PW_EXPECT_TEXT, value: \"${KARS_EXPECT_TEXT:-}\"|" \
       "$HERE/playwright-client-job.yaml" | kubectl $ctx apply -f -
   done
 
@@ -753,17 +785,8 @@ cmd_up_isola() {
   fi
   log "installing isola into existing cluster '$ISOLA_CLUSTER'"
 
-  # KNOWN LIMITATION: isola requires a gVisor (runsc) RuntimeClass on cluster
-  # nodes for real sandbox isolation. Stock kind nodes don't ship containerd
-  # configured for runsc (see isola's hack/setup.sh for the full node config),
-  # which is out of scope for this harness. We still install the RuntimeClass
-  # object so Sandbox CRs don't fail admission, but without a working runsc
-  # shim, sandbox pods will fail to start — the same failure mode kars hits
-  # without its controller installed. Treat `up-isola` as sufficient for
-  # exercising the proxy's Ensure/Delete/List wiring against the Sandbox CR
-  # API, not as a full isolation smoke test, until a gVisor-capable node is
-  # available (e.g. a real cluster with gVisor installed per isola's README).
-  log "installing gVisor RuntimeClass (isolation itself requires runsc on nodes; see comment above)"
+  bash "$HERE/install-gvisor-kind.sh" "$ISOLA_CLUSTER"
+  log "installing gVisor RuntimeClass"
   cat <<'EOF' | kubectl $(isola_ctx) apply -f -
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -774,6 +797,7 @@ EOF
 
   log "installing isola Helm chart into $ISOLA_SYSTEM_NS (sandbox namespace: $ISOLA_SANDBOX_NS)"
   helm --kube-context "kind-$ISOLA_CLUSTER" upgrade --install isola "$ISOLA_CHART" \
+    --version "$ISOLA_VERSION" \
     --namespace "$ISOLA_SYSTEM_NS" \
     --create-namespace \
     --set sandboxNamespace.name="$ISOLA_SANDBOX_NS" \
@@ -785,11 +809,9 @@ EOF
   kind load docker-image "$PROXY_IMAGE" --name "$ISOLA_CLUSTER"
 
   log "building Playwright image $PLAYWRIGHT_IMAGE"
-  cp "$HERE/playwright-substrate-server.js" "$HERE/server.js"
   docker build --platform "linux/$(go env GOARCH)" \
     -t "$PLAYWRIGHT_IMAGE" \
     -f "$HERE/playwright-substrate.Dockerfile" "$HERE" >/dev/null
-  rm -f "$HERE/server.js"
   log "loading $PLAYWRIGHT_IMAGE into isola cluster"
   docker save "$PLAYWRIGHT_IMAGE" \
     | docker exec -i "$ISOLA_CLUSTER-control-plane" \
@@ -812,6 +834,9 @@ EOF
       -e "s/PROXY_NAMESPACE/$ISOLA_NS/g" \
       -e "s/SANDBOX_PORT/9222/g" \
       "$ROOT/deploy/examples/isola/networkpolicy-allow-proxy.yaml" \
+    | kubectl $(isola_ctx) apply -f -
+  sed -e "s/ISOLA_NAMESPACE/$ISOLA_SANDBOX_NS/g" \
+      -e "s/PROXY_NAMESPACE/$ISOLA_NS/g" "$HERE/isola-allow-test-target.yaml" \
     | kubectl $(isola_ctx) apply -f -
 
   log "applying playwright scripts ConfigMap"
@@ -877,7 +902,7 @@ cmd_test_isola() {
 
   # Assert that Sandbox CRs exist, in the shared sandbox namespace.
   for id in alpha beta; do
-    kubectl $ctx -n "$ISOLA_SANDBOX_NS" get sandbox "pw-$id" >/dev/null \
+    kubectl $ctx -n "$ISOLA_SANDBOX_NS" get sandboxes.sandbox.isola.run "pw-$id" >/dev/null \
       || fail "expected Sandbox pw-$id to exist in $ISOLA_SANDBOX_NS"
     log "Sandbox pw-$id ✓"
   done
@@ -885,9 +910,9 @@ cmd_test_isola() {
   # Assert distinct pod IPs (all Sandbox CRs share one namespace, unlike kars,
   # so isolation is verified by IP rather than by namespace).
   local ip_a ip_b
-  ip_a=$(kubectl $ctx -n "$ISOLA_SANDBOX_NS" get sandbox pw-alpha \
+  ip_a=$(kubectl $ctx -n "$ISOLA_SANDBOX_NS" get sandboxes.sandbox.isola.run pw-alpha \
     -o jsonpath='{.status.podIP}' 2>/dev/null || true)
-  ip_b=$(kubectl $ctx -n "$ISOLA_SANDBOX_NS" get sandbox pw-beta \
+  ip_b=$(kubectl $ctx -n "$ISOLA_SANDBOX_NS" get sandboxes.sandbox.isola.run pw-beta \
     -o jsonpath='{.status.podIP}' 2>/dev/null || true)
   [ -n "$ip_a" ] && [ -n "$ip_b" ] || fail "Sandbox status.podIP not populated"
   [ "$ip_a" != "$ip_b" ]           || fail "alpha and beta share podIP: $ip_a"
@@ -907,12 +932,31 @@ cmd_down_isola() {
 
 # ── substrate backend ──────────────────────────────────────────────────────────
 
-SUBSTRATE_REPO="${SUBSTRATE_REPO:-$ROOT/../substrate}"
+SUBSTRATE_REPO="${SUBSTRATE_REPO:-$ROOT/.backend-sources/substrate/$SUBSTRATE_VERSION}"
 SUBSTRATE_CLUSTER="${SUBSTRATE_CLUSTER:-kind}"          # substrate's default
 SUBSTRATE_NS="${SUBSTRATE_NS:-pw-substrate}"
 SUBSTRATE_TEMPLATE_NAME="${SUBSTRATE_TEMPLATE_NAME:-playwright}"
+KUBECTL_ATE="${KUBECTL_ATE:-$SUBSTRATE_REPO/bin/kubectl-ate}"
 
 substrate_ctx_args() { echo "--context=kind-$SUBSTRATE_CLUSTER"; }
+
+cmd_up_substrate() {
+  ensure_source agent-substrate/substrate "$SUBSTRATE_VERSION" "$SUBSTRATE_REPO"
+  if ! kind get clusters | grep -qx "$SUBSTRATE_CLUSTER"; then
+    (cd "$SUBSTRATE_REPO" && KIND_CLUSTER_NAME="$SUBSTRATE_CLUSTER" hack/create-kind-cluster.sh)
+  fi
+  # Envoy's watches need more than Docker's common default of 128 instances.
+  local node current
+  for node in $(kind get nodes --name "$SUBSTRATE_CLUSTER"); do
+    current=$(docker exec "$node" sysctl -n fs.inotify.max_user_instances)
+    if [ "$current" -lt 8192 ]; then
+      docker exec "$node" sysctl -w fs.inotify.max_user_instances=8192
+    fi
+  done
+  (cd "$SUBSTRATE_REPO" && KIND_CLUSTER_NAME="$SUBSTRATE_CLUSTER" \
+    BUILDX_BUILDER="${BUILDX_BUILDER:-$(docker context show)}" \
+    hack/install-ate-kind.sh --deploy-ate-system --credential-provider='{"enabled":false}' --rollout-timeout 300s)
+}
 
 # Asserts substrate's ate-system is installed in the substrate kind cluster.
 require_substrate() {
@@ -949,13 +993,27 @@ ensure_ateom_image() {
   echo "$img"
 }
 
+ensure_actor_template() {
+  local manifest existing
+  manifest=$(cat)
+  if existing=$("$KUBECTL_ATE" --context "kind-$SUBSTRATE_CLUSTER" get actor-template \
+      "$SUBSTRATE_TEMPLATE_NAME" -a "$SUBSTRATE_NS" 2>&1); then
+    log "reusing immutable ActorTemplate $SUBSTRATE_NS/$SUBSTRATE_TEMPLATE_NAME (use a new SUBSTRATE_TEMPLATE_NAME to change its spec)"
+  elif printf '%s' "$existing" | grep -q 'NotFound'; then
+    printf '%s\n' "$manifest" | "$KUBECTL_ATE" --context "kind-$SUBSTRATE_CLUSTER" create actor-template -f -
+  else
+    fail "$existing"
+  fi
+}
+
 cmd_test_substrate() {
-  # SUBSTRATE_FLAVOUR=playwright runs Chromium-under-gVisor (heavier, slower);
-  # default flavour uses traefik/whoami to exercise the proxy's gRPC + Host
-  # routing path without dragging Chromium into the test budget.
-  local flavour="${SUBSTRATE_FLAVOUR:-whoami}"
+  # Default to a real browser; whoami remains available for lightweight smoke tests.
+  local flavour="${SUBSTRATE_FLAVOUR:-playwright}"
   log "substrate backend smoke test (flavour=$flavour) against cluster '$SUBSTRATE_CLUSTER'"
   require_substrate
+  if [ ! -x "$KUBECTL_ATE" ]; then
+    (cd "$SUBSTRATE_REPO" && go build -o "$KUBECTL_ATE" ./cmd/kubectl-ate)
+  fi
 
   log "building + loading proxy image into substrate cluster"
   (cd "$ROOT" && docker build -q -t "$PROXY_IMAGE" .) >/dev/null
@@ -969,6 +1027,9 @@ cmd_test_substrate() {
   log "creating namespace $SUBSTRATE_NS"
   kubectl $(substrate_ctx_args) get ns "$SUBSTRATE_NS" >/dev/null 2>&1 \
     || kubectl $(substrate_ctx_args) create ns "$SUBSTRATE_NS"
+  kubectl $(substrate_ctx_args) label ns "$SUBSTRATE_NS" ate.dev/api-access=true --overwrite
+  "$KUBECTL_ATE" --context "kind-$SUBSTRATE_CLUSTER" get atespace "$SUBSTRATE_NS" >/dev/null 2>&1 \
+    || "$KUBECTL_ATE" --context "kind-$SUBSTRATE_CLUSTER" create atespace "$SUBSTRATE_NS"
 
   log "applying proxy RBAC"
   sed "s/NAMESPACE/$SUBSTRATE_NS/g" "$ROOT/deploy/rbac.yaml" | kubectl $(substrate_ctx_args) apply -f -
@@ -982,15 +1043,14 @@ cmd_test_substrate() {
   case "$flavour" in
     whoami)
       sed -e "s|NAMESPACE|$SUBSTRATE_NS|g" -e "s|NAME|$SUBSTRATE_TEMPLATE_NAME|g" \
-        "$HERE/substrate-actortemplate.yaml" | kubectl $(substrate_ctx_args) apply -f -
+        "$HERE/substrate-actortemplate.yaml" \
+        | ensure_actor_template
       ;;
     playwright)
-      log "building custom Playwright image (server.js baked in, --single-process)"
-      cp "$HERE/playwright-substrate-server.js" "$HERE/server.js"
+      log "building custom Playwright image (server.js baked in)"
       docker build --platform "linux/$(go env GOARCH)" \
         -t localhost:5001/playwright-substrate:slim-1.53.0 \
         -f "$HERE/playwright-substrate.Dockerfile" "$HERE" >/dev/null
-      rm -f "$HERE/server.js"
       log "pushing to local registry that substrate's atelet reads from"
       docker push localhost:5001/playwright-substrate:slim-1.53.0 >/dev/null
       local pw_digest
@@ -999,15 +1059,16 @@ cmd_test_substrate() {
       sed -e "s|NAMESPACE|$SUBSTRATE_NS|g" \
           -e "s|NAME|$SUBSTRATE_TEMPLATE_NAME|g" \
           -e "s|PLAYWRIGHT_IMAGE|$pw_digest|" \
-          "$HERE/substrate-actortemplate-playwright.yaml" | kubectl $(substrate_ctx_args) apply -f -
+          "$HERE/substrate-actortemplate-playwright.yaml" \
+          | ensure_actor_template
       ;;
     *) fail "unknown SUBSTRATE_FLAVOUR=$flavour (want whoami|playwright)" ;;
   esac
 
   local upstream_port=80
-  [ "$flavour" = playwright ] && upstream_port=9222
   log "deploying proxy (BACKEND=substrate, SANDBOX_PORT=$upstream_port)"
   sed -e "s|namespace: NAMESPACE|namespace: $SUBSTRATE_NS|g" \
+      -e "s|test-target.NAMESPACE|test-target.$SUBSTRATE_NS|g" \
       -e "s|image: PROXY_IMAGE|image: $PROXY_IMAGE|g" \
       -e "s|value: \"ACTOR_TEMPLATE\"|value: \"$SUBSTRATE_NS/$SUBSTRATE_TEMPLATE_NAME\"|" \
       -e "s|value: \"80\"|value: \"$upstream_port\"|" \
@@ -1030,28 +1091,42 @@ cmd_test_substrate() {
     log "client $id hits proxy (substrate ensures an actor on first request)"
     set +e
     out=$(kubectl $(substrate_ctx_args) -n "$SUBSTRATE_NS" exec "client-$id" -c curl -- \
-      curl -sS --max-time 60 "http://playwright-proxy:9000/")
+      curl -fsS --max-time 180 "http://playwright-proxy:9000/")
     status=$?
     set -e
     printf '%s\n' "$out" | sed "s/^/    [$id] /"
     if [ $status -ne 0 ] || [ -z "$out" ]; then
       log "request failed — dumping proxy + api-server logs"
       kubectl $(substrate_ctx_args) -n "$SUBSTRATE_NS" logs deploy/playwright-proxy --tail=40 || true
-      kubectl $(substrate_ctx_args) -n ate-system logs deploy/ate-api-server-deployment --tail=20 || true
+      kubectl $(substrate_ctx_args) -n ate-system logs deploy/ate-api-server --tail=20 || true
       fail "substrate request from client-$id failed"
     fi
     host=$(printf '%s\n' "$out" | awk -F': ' '/^Hostname/ {print $2; exit}')
-    [ "$host" = "runsc" ] || log "WARN: expected response from runsc (gVisor) actor, got hostname=$host"
+    if [ "$flavour" = whoami ] && [ "$host" != "runsc" ]; then
+      fail "expected response from runsc (gVisor) actor, got hostname=$host"
+    fi
   done
 
   log "verifying actors exist via ate-api-server"
-  if command -v kubectl-ate >/dev/null 2>&1; then
+  for id in alpha beta; do
+    "$KUBECTL_ATE" --context "kind-$SUBSTRATE_CLUSTER" get actor "pw-$id" -a "$SUBSTRATE_NS" \
+      || fail "actor pw-$id not found"
+  done
+
+  if [ "$flavour" = playwright ]; then
+    docker save "$PLAYWRIGHT_IMAGE" | docker exec -i "$SUBSTRATE_CLUSTER-control-plane" \
+      ctr --namespace=k8s.io images import --no-unpack -
+    sed "s/NAMESPACE/$SUBSTRATE_NS/g" "$HERE/playwright-scripts.yaml" | kubectl $(substrate_ctx_args) apply -f -
+    sed "s/NAMESPACE/$SUBSTRATE_NS/g" "$HERE/test-target.yaml" | kubectl $(substrate_ctx_args) apply -f -
+    kubectl $(substrate_ctx_args) -n "$SUBSTRATE_NS" rollout status deploy/test-target --timeout=60s
     for id in alpha beta; do
-      kubectl-ate --context "kind-$SUBSTRATE_CLUSTER" get actor "pw-$id" 2>&1 | sed "s/^/    [actor $id] /" \
-        || fail "actor pw-$id not found"
+      kubectl $(substrate_ctx_args) -n "$SUBSTRATE_NS" delete job "playwright-e2e-$id" --ignore-not-found
+      sed -e "s/NAMESPACE/$SUBSTRATE_NS/g" -e "s/CLIENTID/$id/g" \
+        -e "s|image: PLAYWRIGHT_IMAGE|image: $PLAYWRIGHT_IMAGE|" \
+        "$HERE/playwright-client-job.yaml" | kubectl $(substrate_ctx_args) apply -f -
+      NAMESPACE="$SUBSTRATE_NS" CLUSTER="$SUBSTRATE_CLUSTER" wait_for_job_success "playwright-e2e-$id" 300
+      kubectl $(substrate_ctx_args) -n "$SUBSTRATE_NS" logs "job/playwright-e2e-$id"
     done
-  else
-    log "kubectl-ate not installed; install with 'cd substrate && go install ./cmd/kubectl-ate' to verify actors"
   fi
 
   log "substrate smoke test PASSED"
@@ -1070,6 +1145,7 @@ case "${1:-}" in
   up-kars)   shift; cmd_up_kars   "$@" ;;
   down-kars) shift; cmd_down_kars "$@" ;;
   up-isola)   shift; cmd_up_isola   "$@" ;;
+  up-substrate) shift; cmd_up_substrate "$@" ;;
   down-isola) shift; cmd_down_isola "$@" ;;
   ""|-h|--help)
     sed -n '2,16p' "$0"

@@ -18,17 +18,20 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
 
 var karsSandboxGVR = schema.GroupVersionResource{
-	Group:   "kars.azure.com",
-	Version: "v1alpha1",
+	Group:    "kars.azure.com",
+	Version:  "v1alpha1",
 	Resource: "karssandboxes",
 }
 
@@ -38,12 +41,12 @@ const karsSandboxAPIVersion = "kars.azure.com/v1alpha1"
 const karsSandboxComponentLabel = "kars.azure.com/component=sandbox"
 
 type KarsSandboxBackend struct {
-	dynClient             dynamic.NamespaceableResourceInterface
-	k8s                   kubernetes.Interface
-	namespace             string // namespace where the KarsSandbox CR lives
-	inferenceRef          string // name of the InferencePolicy CR in that namespace
-	image                 string // Playwright container image
-	port                  int    // port the Playwright server listens on inside the pod
+	dynClient            dynamic.NamespaceableResourceInterface
+	k8s                  kubernetes.Interface
+	namespace            string // namespace where the KarsSandbox CR lives
+	inferenceRef         string // name of the InferencePolicy CR in that namespace
+	image                string // Playwright container image
+	port                 int    // port the Playwright server listens on inside the pod
 	playwrightIDLabelKey string // configurable label key for playwright-id
 }
 
@@ -55,12 +58,12 @@ func NewKarsSandbox(
 	labelKey string,
 ) *KarsSandboxBackend {
 	return &KarsSandboxBackend{
-		dynClient:             dyn.Resource(karsSandboxGVR),
-		k8s:                   k8s,
-		namespace:             namespace,
-		inferenceRef:          inferenceRef,
-		image:                 image,
-		port:                  port,
+		dynClient:            dyn.Resource(karsSandboxGVR),
+		k8s:                  k8s,
+		namespace:            namespace,
+		inferenceRef:         inferenceRef,
+		image:                image,
+		port:                 port,
 		playwrightIDLabelKey: labelKey,
 	}
 }
@@ -87,17 +90,47 @@ func (k *KarsSandboxBackend) Ensure(ctx context.Context, playwrightID string) (E
 		return Endpoint{}, err
 	}
 
-	// Phase 2: wait for pod to be ready (confirms sandbox is up).
-	// Use Service DNS name instead of pod IP because KARS sandboxes run in
-	// isolated namespaces with NetworkPolicies that block direct pod access.
-	_, err = k.waitForPodIP(ctx, sandboxNs)
+	// KARS v0.1.26 exposes only inference on its generated Service. Open the
+	// browser port exclusively to this proxy, then dial the actual ready pod.
+	if err := k.ensureProxyIngress(ctx, sandboxNs, name); err != nil {
+		return Endpoint{}, err
+	}
+	ip, err := k.waitForPodIP(ctx, sandboxNs)
 	if err != nil {
 		return Endpoint{}, err
 	}
 
-	// Return Service DNS name: <sandbox-name>.<sandbox-namespace>.svc.cluster.local
-	serviceFQDN := fmt.Sprintf("%s.%s.svc.cluster.local", name, sandboxNs)
-	return Endpoint{Host: serviceFQDN, Port: k.port}, nil
+	return Endpoint{Host: ip, Port: k.port}, nil
+}
+
+func (k *KarsSandboxBackend) ensureProxyIngress(ctx context.Context, namespace, name string) error {
+	protocol := corev1.ProtocolTCP
+	desired := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "playwright-proxy-ingress", Namespace: namespace, Labels: map[string]string{managedByLabel: "true"}},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"kars.azure.com/sandbox": name}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": k.namespace}},
+					PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "playwright-proxy"}},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocol, Port: &intstr.IntOrString{Type: intstr.Int, IntVal: int32(k.port)}}},
+			}},
+		},
+	}
+	policies := k.k8s.NetworkingV1().NetworkPolicies(namespace)
+	existing, err := policies.Create(ctx, desired, metav1.CreateOptions{})
+	if isAlreadyExists(err) {
+		existing, err = policies.Get(ctx, desired.Name, metav1.GetOptions{})
+	}
+	if err != nil {
+		return fmt.Errorf("ensure KARS browser ingress in %s: %w", namespace, err)
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+		return fmt.Errorf("KARS browser ingress policy in %s differs from proxy configuration; reconcile it explicitly", namespace)
+	}
+	return nil
 }
 
 // waitForRunning polls the KarsSandbox CR until status.phase is "Running"
@@ -148,9 +181,13 @@ func (k *KarsSandboxBackend) waitForPodIP(ctx context.Context, sandboxNs string)
 		}
 		for i := range pods.Items {
 			p := &pods.Items[i]
-			if p.Status.Phase == corev1.PodRunning && p.Status.PodIP != "" {
-				ip = p.Status.PodIP
-				return true, nil
+			if p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning && p.Status.PodIP != "" {
+				for _, condition := range p.Status.Conditions {
+					if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+						ip = p.Status.PodIP
+						return true, nil
+					}
+				}
 			}
 		}
 		return false, nil
@@ -195,7 +232,7 @@ func (k *KarsSandboxBackend) buildCR(name, playwrightID string) *unstructured.Un
 			"name":      name,
 			"namespace": k.namespace,
 			"labels": map[string]any{
-				managedByLabel:          "true",
+				managedByLabel:         "true",
 				k.playwrightIDLabelKey: playwrightID,
 			},
 		},
@@ -203,8 +240,8 @@ func (k *KarsSandboxBackend) buildCR(name, playwrightID string) *unstructured.Un
 			"runtime": map[string]any{
 				"kind": "BYO",
 				"byo": map[string]any{
-					"image":            k.image,
-					"command":          []any{"node", "/server.js"},
+					"image":           k.image,
+					"command":         []any{"node", "/server.js"},
 					"contractVersion": "v1",
 					"env": []any{
 						map[string]any{"name": "PORT", "value": fmt.Sprintf("%d", k.port)},

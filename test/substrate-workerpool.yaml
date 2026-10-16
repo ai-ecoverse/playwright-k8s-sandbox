@@ -3,7 +3,15 @@ kind: WorkerPool
 metadata:
   name: NAME
   namespace: NAMESPACE
+  labels:
+    workload: playwright
 spec:
   replicas: 2
   # Pushed by substrate's hack/install-ate-kind.sh. Substituted by the harness.
-  ateomImage: ATEOM_IMAGE
+  workerImage: ATEOM_IMAGE
+  sandboxClasses:
+    - name: gvisor
+  template:
+    resources:
+      requests: { cpu: 250m, memory: 1Gi }
+      limits: { cpu: "1", memory: 1Gi }

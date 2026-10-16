@@ -2,6 +2,23 @@ package config
 
 import "testing"
 
+func TestSubstrateHTTPHosts(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "test")
+	t.Setenv("BACKEND", "substrate")
+	t.Setenv("SUBSTRATE_ACTOR_TEMPLATE", "test/browser")
+	t.Setenv("SUBSTRATE_ALLOWED_HTTP_HOSTS", "fixture.test, second.test")
+	c, err := FromEnv()
+	if err != nil || len(c.SubstrateAllowedHTTPHosts) != 2 || c.SubstrateAllowedHTTPHosts[1] != "second.test" {
+		t.Fatalf("config=%v error=%v", c, err)
+	}
+	for _, invalid := range []string{"http://fixture.test", "fixture.test:80", "fixture.test,", "bad host"} {
+		t.Setenv("SUBSTRATE_ALLOWED_HTTP_HOSTS", invalid)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("accepted %q", invalid)
+		}
+	}
+}
+
 func TestParsePort(t *testing.T) {
 	tests := []struct {
 		name      string

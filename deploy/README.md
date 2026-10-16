@@ -2,6 +2,12 @@
 
 This directory contains Kubernetes manifests for deploying the Playwright proxy.
 
+Release pins and current kind results are in the
+[October 2026 update](../docs/blog/sandbox-updates-2026-10.md). Substrate v0.5
+uses API-managed templates, projected bearer tokens and explicit actor egress;
+follow its [deployment guide](examples/substrate/README.md) rather than applying
+an ActorTemplate with kubectl. KARS needs its additional RBAC and policies.
+
 ## Prerequisites
 
 - Kubernetes cluster (1.24+)
@@ -60,7 +66,9 @@ The proxy is configured via environment variables in `proxy.yaml`:
 
 For substrate backend, also configure:
 - `SUBSTRATE_ROUTER_ADDR`: Substrate router address
-- `SUBSTRATE_ACTOR_TEMPLATE`: Actor template name
+- `SUBSTRATE_ACTOR_TEMPLATE`: `atespace/name` of an API ActorTemplate
+- `SUBSTRATE_TOKEN_FILE`: token projected with audience `api.ate-system.svc`
+- `SUBSTRATE_ALLOWED_HTTP_HOSTS`: optional managed HTTP/80 egress allowlist
 
 ## Security Features
 

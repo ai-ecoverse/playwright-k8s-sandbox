@@ -11,6 +11,8 @@ import (
 
 type Endpoint struct {
 	Host string
+	// TargetActor is the trusted atespace/name for substrate's ingress header.
+	TargetActor string
 	// Port is the native Playwright WebSocket port (chromium.launchServer).
 	Port int
 	// MCPPort is the port serving MCP-over-HTTP. @playwright/mcp cannot share a

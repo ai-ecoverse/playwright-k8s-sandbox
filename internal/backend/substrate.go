@@ -1,7 +1,6 @@
 // Substrate backend: talks to substrate's Control gRPC service on
 // ate-api-server to manage actor lifecycles. Data-plane traffic still flows
-// through this proxy — we just rewrite the Host header to
-// `<actor-id>.actors.resources.substrate.ate.dev` and forward to atenet-router,
+// through this proxy using a trusted ate-target-actor routing header,
 // which substrate already runs as a multiplexing data plane.
 //
 // One actor per playwright-id. Ensure is idempotent: GetActor first, CreateActor
@@ -17,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -25,32 +25,21 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/carlossg/playwright-k8s-sandbox/internal/backend/ateapipb"
 )
 
 // readyPollInterval is how often Ensure polls GetActor while waiting for the
-// actor to reach STATUS_RUNNING. readyDeadline is the per-request budget — if
-// the actor isn't running by then, return the atenet endpoint anyway and let
-// downstream decide (atenet will queue the WS upgrade or refuse).
+// actor to reach ACTOR_STATE_RUNNING. A missed deadline is an error.
 const (
 	readyPollInterval = 200 * time.Millisecond
 	readyDeadline     = 60 * time.Second
-	// upstreamReadyDeadline bounds the post-RUNNING probe to atenet — Substrate
-	// reports STATUS_RUNNING as soon as `runsc restore` exits, but with
-	// -direct/-background lazy paging the in-sandbox Chromium can still be
-	// finishing its boot, so atenet returns 503 (upstream connection refused)
-	// for a few seconds. We probe until the upstream stops failing so the
-	// caller's WS upgrade isn't forwarded to a refusing socket.
+	// Running state can precede the application's listening socket after a
+	// restore. Probe the data plane before forwarding the caller's upgrade.
 	upstreamReadyDeadline = 30 * time.Second
 	upstreamProbeInterval = 200 * time.Millisecond
 )
-
-// SubstrateActorHost is the Host header suffix substrate's atenet-router uses
-// to dispatch traffic to a named actor. See substrate counter demo:
-//
-//	curl -H "Host: my-counter-1.actors.resources.substrate.ate.dev" http://atenet-router/
-const SubstrateActorHost = "actors.resources.substrate.ate.dev"
 
 type Substrate struct {
 	control           ateapipb.ControlClient
@@ -60,13 +49,7 @@ type Substrate struct {
 	atenetRouterHost  string
 	atenetRouterPort  int
 	probeClient       *http.Client
-	// forceBoot, if true, passes Boot=true to ResumeActor so substrate skips
-	// the snapshot restore path and boots from the ActorTemplate spec instead.
-	// Substrate's snapshot restore (golden + per-actor) currently fails to
-	// bring the app sub-container's process tree back — the sandbox restores
-	// but `runsc list` shows the sub-container in `stopped` state with no
-	// pid. Boot-from-spec is reliable; this is the working fallback.
-	forceBoot bool
+	allowedHTTPHosts  []string
 }
 
 // NewSubstrate dials the ate-api-server's gRPC endpoint and returns a backend
@@ -79,10 +62,11 @@ func NewSubstrate(apiEndpoint, atenetRouterAddr, actorTemplateRef string) (*Subs
 	return NewSubstrateWithOptions(apiEndpoint, atenetRouterAddr, actorTemplateRef, false)
 }
 
-// NewSubstrateWithOptions exposes the forceBoot toggle. When forceBoot=true,
-// ResumeActor is always called with Boot=true, skipping substrate's broken
-// snapshot restore path.
-func NewSubstrateWithOptions(apiEndpoint, atenetRouterAddr, actorTemplateRef string, forceBoot bool) (*Substrate, error) {
+// NewSubstrateWithOptions rejects the legacy boot override removed in v0.5.
+func NewSubstrateWithOptions(apiEndpoint, atenetRouterAddr, actorTemplateRef string, forceBoot bool, allowedHTTPHosts ...string) (*Substrate, error) {
+	if forceBoot {
+		return nil, fmt.Errorf("SUBSTRATE_FORCE_BOOT is unsupported by substrate v0.5.0; configure snapshotConfig on the ActorTemplate instead")
+	}
 	if apiEndpoint == "" {
 		return nil, fmt.Errorf("apiEndpoint required")
 	}
@@ -95,12 +79,23 @@ func NewSubstrateWithOptions(apiEndpoint, atenetRouterAddr, actorTemplateRef str
 		return nil, fmt.Errorf("atenetRouterAddr port: %w", err)
 	}
 	tns, tname, ok := strings.Cut(actorTemplateRef, "/")
-	if !ok {
-		return nil, fmt.Errorf("actorTemplateRef must be 'namespace/name', got %q", actorTemplateRef)
+	if !ok || tns == "" || tname == "" || strings.Contains(tname, "/") {
+		return nil, fmt.Errorf("actorTemplateRef must be 'atespace/name', got %q", actorTemplateRef)
 	}
 
 	creds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
-	conn, err := grpc.NewClient(apiEndpoint, grpc.WithTransportCredentials(creds))
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	tokenFile := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	configured := os.Getenv("SUBSTRATE_TOKEN_FILE")
+	if configured != "" {
+		tokenFile = configured
+	}
+	if _, err := os.Stat(tokenFile); err == nil {
+		opts = append(opts, grpc.WithPerRPCCredentials(serviceAccountTokenSource{path: tokenFile}))
+	} else if configured != "" || !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat service account token: %w", err)
+	}
+	conn, err := grpc.NewClient(apiEndpoint, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial ate-api-server: %w", err)
 	}
@@ -111,7 +106,7 @@ func NewSubstrateWithOptions(apiEndpoint, atenetRouterAddr, actorTemplateRef str
 		actorTemplateName: tname,
 		atenetRouterHost:  host,
 		atenetRouterPort:  port,
-		forceBoot:         forceBoot,
+		allowedHTTPHosts:  append([]string(nil), allowedHTTPHosts...),
 		probeClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -137,8 +132,14 @@ func (s *Substrate) Ensure(ctx context.Context, playwrightID string) (Endpoint, 
 	if err != nil {
 		return Endpoint{}, err
 	}
+	if actor.GetActorTemplate().GetAtespace() != s.actorTemplateNS || actor.GetActorTemplate().GetName() != s.actorTemplateName {
+		return Endpoint{}, fmt.Errorf("actor %s uses a different ActorTemplate; migrate or delete it explicitly", id)
+	}
+	if err := s.ensureEgressPolicy(ctx, id); err != nil {
+		return Endpoint{}, err
+	}
 
-	// Drive to STATUS_RUNNING before returning the atenet endpoint. Without
+	// Drive to ACTOR_STATE_RUNNING before returning the atenet endpoint. Without
 	// this, the proxy would forward the client's WS upgrade to atenet-router
 	// for an actor that's still RESUMING from snapshot, and atenet would close
 	// the upgrade (the client sees a spurious 403/connection drop). Hold the
@@ -147,29 +148,74 @@ func (s *Substrate) Ensure(ctx context.Context, playwrightID string) (Endpoint, 
 		return Endpoint{}, err
 	}
 
-	// STATUS_RUNNING is necessary but not sufficient: with -direct/-background
-	// runsc restore returns before the in-sandbox process is actually serving on
-	// port 80. Probe via atenet so we only hand the WS upgrade off after the
-	// upstream is reachable.
+	// Running state alone does not establish application readiness on port 80.
 	if err := s.waitUpstreamReady(ctx, id); err != nil {
 		return Endpoint{}, err
 	}
 
 	// Substrate's atenet-router is the per-request data plane; the proxy hands
-	// traffic to it with Host: <id>.actors.resources.substrate.ate.dev.
-	return Endpoint{Host: s.atenetRouterHost, Port: s.atenetRouterPort}, nil
+	// traffic to it with ate-target-actor: <atespace>/<id>.
+	return Endpoint{Host: s.atenetRouterHost, Port: s.atenetRouterPort, TargetActor: s.actorTemplateNS + "/" + id}, nil
 }
+
+func (s *Substrate) actorRef(id string) *ateapipb.ObjectRef {
+	return &ateapipb.ObjectRef{Atespace: s.actorTemplateNS, Name: id}
+}
+
+// An explicit allowlist owns the actor's default policy. Never replace a
+// conflicting operator-created policy or weaken the default-deny behavior.
+func (s *Substrate) ensureEgressPolicy(ctx context.Context, id string) error {
+	if len(s.allowedHTTPHosts) == 0 {
+		return nil
+	}
+	rule := &ateapipb.EgressRule{Http: &ateapipb.HttpRule{Hostnames: s.allowedHTTPHosts, Ports: &ateapipb.Ports{Numbers: []int32{80}}}}
+	request := &ateapipb.GetActorEgressPolicyRequest{Actor: s.actorRef(id), Name: "default"}
+	policy, err := s.control.GetActorEgressPolicy(ctx, request)
+	if status.Code(err) == codes.NotFound {
+		policy, err = s.control.CreateActorEgressPolicy(ctx, &ateapipb.CreateActorEgressPolicyRequest{
+			Actor: s.actorRef(id),
+			EgressPolicy: &ateapipb.EgressPolicy{
+				Metadata: &ateapipb.ResourceMetadata{Atespace: s.actorTemplateNS, Name: "default"},
+				Rules:    []*ateapipb.EgressRule{rule},
+			},
+		})
+		if status.Code(err) == codes.AlreadyExists {
+			policy, err = s.control.GetActorEgressPolicy(ctx, request)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("egress policy for actor %s: %w", id, err)
+	}
+	if len(policy.GetRules()) != 1 || !proto.Equal(policy.GetRules()[0], rule) {
+		return fmt.Errorf("actor %s default egress policy differs from SUBSTRATE_ALLOWED_HTTP_HOSTS; reconcile it explicitly", id)
+	}
+	return nil
+}
+
+type serviceAccountTokenSource struct{ path string }
+
+func (s serviceAccountTokenSource) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	token, err := os.ReadFile(s.path)
+	if err != nil {
+		return nil, fmt.Errorf("read service account token: %w", err)
+	}
+	value := strings.TrimSpace(string(token))
+	if value == "" {
+		return nil, fmt.Errorf("service account token is empty")
+	}
+	return map[string]string{"authorization": "Bearer " + value}, nil
+}
+
+func (serviceAccountTokenSource) RequireTransportSecurity() bool { return true }
 
 // waitUpstreamReady polls atenet-router until the upstream stops failing.
 // atenet returns 503 with "remote connection failure" while the actor's
-// Chromium hasn't bound to port 80 yet; anything else (200, 404, 405, even
-// 500) indicates the request reached the actor process and substrate's data
-// plane is wired up, so we let the caller's real request through.
+// Chromium hasn't bound to port 80 yet. Accept non-error application responses
+// (including 404/405 for HEAD), but not authentication or actor-routing errors.
 func (s *Substrate) waitUpstreamReady(ctx context.Context, id string) error {
 	start := time.Now()
 	deadline := start.Add(upstreamReadyDeadline)
 	url := fmt.Sprintf("http://%s:%d/", s.atenetRouterHost, s.atenetRouterPort)
-	host := fmt.Sprintf("%s.%s", id, SubstrateActorHost)
 	attempt := 0
 	for {
 		attempt++
@@ -179,13 +225,13 @@ func (s *Substrate) waitUpstreamReady(ctx context.Context, id string) error {
 			cancel()
 			return fmt.Errorf("build probe req: %w", err)
 		}
-		req.Host = host
+		req.Header.Set("ate-target-actor", s.actorTemplateNS+"/"+id)
 		resp, err := s.probeClient.Do(req)
 		cancel()
 		if err == nil {
 			code := resp.StatusCode
 			resp.Body.Close()
-			if code != http.StatusServiceUnavailable {
+			if code >= 200 && code < 500 && code != http.StatusMisdirectedRequest && code != http.StatusUnauthorized && code != http.StatusForbidden {
 				slog.Info("substrate: upstream ready",
 					"id", id, "attempt", attempt,
 					"elapsed", time.Since(start).String(), "code", code)
@@ -193,9 +239,7 @@ func (s *Substrate) waitUpstreamReady(ctx context.Context, id string) error {
 			}
 		}
 		if time.Now().After(deadline) {
-			slog.Warn("substrate: upstream probe deadline; proceeding anyway",
-				"id", id, "deadline", upstreamReadyDeadline, "attempts", attempt)
-			return nil
+			return fmt.Errorf("substrate actor %s upstream not ready after %s (%d attempts)", id, upstreamReadyDeadline, attempt)
 		}
 		select {
 		case <-ctx.Done():
@@ -209,44 +253,45 @@ func (s *Substrate) waitUpstreamReady(ctx context.Context, id string) error {
 // Handles the race where a concurrent caller created the actor between our
 // GetActor and CreateActor.
 func (s *Substrate) getOrCreate(ctx context.Context, id string) (*ateapipb.Actor, error) {
-	if resp, err := s.control.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: id}); err == nil {
-		return resp.GetActor(), nil
+	if resp, err := s.control.GetActor(ctx, &ateapipb.GetActorRequest{Actor: s.actorRef(id)}); err == nil {
+		return resp, nil
 	} else if st, _ := status.FromError(err); st.Code() != codes.NotFound {
 		return nil, fmt.Errorf("GetActor %s: %w", id, err)
 	}
 	cResp, err := s.control.CreateActor(ctx, &ateapipb.CreateActorRequest{
-		ActorId:                id,
-		ActorTemplateNamespace: s.actorTemplateNS,
-		ActorTemplateName:      s.actorTemplateName,
+		Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: s.actorTemplateNS, Name: id},
+			ActorTemplate: s.actorRef(s.actorTemplateName),
+		},
 	})
 	if err == nil {
-		return cResp.GetActor(), nil
+		return cResp, nil
 	}
 	if st, _ := status.FromError(err); st.Code() == codes.AlreadyExists {
 		// Another caller beat us to CreateActor; re-fetch the actor.
-		resp, err := s.control.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: id})
+		resp, err := s.control.GetActor(ctx, &ateapipb.GetActorRequest{Actor: s.actorRef(id)})
 		if err != nil {
 			return nil, fmt.Errorf("re-GetActor %s after AlreadyExists: %w", id, err)
 		}
-		return resp.GetActor(), nil
+		return resp, nil
 	}
 	return nil, fmt.Errorf("CreateActor %s: %w", id, err)
 }
 
-// waitForRunning polls until the actor is STATUS_RUNNING. If the actor is
+// waitForRunning polls until the actor is ACTOR_STATE_RUNNING. If the actor is
 // SUSPENDED, we kick it via ResumeActor first. Returns the last observed
 // Actor on success; on deadline, returns the last observed actor and an error
-// so callers can decide whether to proceed (atenet may still queue traffic).
+// for diagnosis; Ensure does not forward traffic on that failure.
 func (s *Substrate) waitForRunning(ctx context.Context, id string, actor *ateapipb.Actor) (*ateapipb.Actor, error) {
 	deadline := time.Now().Add(readyDeadline)
 	resumed := false
 	for {
-		switch actor.GetStatus() {
-		case ateapipb.Actor_STATUS_RUNNING:
+		switch actor.GetStatus().GetState() {
+		case ateapipb.ActorState_ACTOR_STATE_RUNNING:
 			return actor, nil
-		case ateapipb.Actor_STATUS_SUSPENDED:
+		case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
 			if !resumed {
-				if _, err := s.control.ResumeActor(ctx, &ateapipb.ResumeActorRequest{ActorId: id, Boot: s.forceBoot}); err != nil {
+				if _, err := s.control.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: s.actorRef(id)}); err != nil {
 					st, _ := status.FromError(err)
 					// FailedPrecondition can happen if the actor just left
 					// SUSPENDED between our Get and Resume — fall through and
@@ -258,19 +303,25 @@ func (s *Substrate) waitForRunning(ctx context.Context, id string, actor *ateapi
 				resumed = true
 				slog.Info("substrate: resumed actor", "id", id)
 			}
-		case ateapipb.Actor_STATUS_RESUMING, ateapipb.Actor_STATUS_SUSPENDING, ateapipb.Actor_STATUS_UNSPECIFIED:
+		case ateapipb.ActorState_ACTOR_STATE_CRASHED, ateapipb.ActorState_ACTOR_STATE_DELETING:
+			return actor, fmt.Errorf("actor %s entered %s: %s", id, actor.GetStatus().GetState(), actor.GetStatus().GetCrash().GetMessage())
+		default:
 			// fall through to poll
 		}
 		if time.Now().After(deadline) {
-			return actor, fmt.Errorf("actor %s did not reach STATUS_RUNNING within %s (last=%s)",
+			return actor, fmt.Errorf("actor %s did not reach ACTOR_STATE_RUNNING within %s (last=%s)",
 				id, readyDeadline, actor.GetStatus())
 		}
-		time.Sleep(readyPollInterval)
-		resp, err := s.control.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: id})
+		select {
+		case <-ctx.Done():
+			return actor, ctx.Err()
+		case <-time.After(readyPollInterval):
+		}
+		resp, err := s.control.GetActor(ctx, &ateapipb.GetActorRequest{Actor: s.actorRef(id)})
 		if err != nil {
 			return actor, fmt.Errorf("GetActor %s during wait: %w", id, err)
 		}
-		actor = resp.GetActor()
+		actor = resp
 	}
 }
 
@@ -278,13 +329,13 @@ func (s *Substrate) Delete(ctx context.Context, playwrightID string) error {
 	id := actorID(playwrightID)
 	// Substrate only deletes suspended actors. Suspend first; ignore the error
 	// if it's already suspended.
-	if _, err := s.control.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: id}); err != nil {
+	if _, err := s.control.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: s.actorRef(id)}); err != nil {
 		st, _ := status.FromError(err)
 		if st.Code() != codes.NotFound && st.Code() != codes.FailedPrecondition {
 			return fmt.Errorf("SuspendActor %s: %w", id, err)
 		}
 	}
-	if _, err := s.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: id}); err != nil {
+	if _, err := s.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: s.actorRef(id)}); err != nil {
 		st, _ := status.FromError(err)
 		if st.Code() != codes.NotFound {
 			return fmt.Errorf("DeleteActor %s: %w", id, err)
@@ -298,14 +349,17 @@ func (s *Substrate) List(ctx context.Context) ([]string, error) {
 	pageToken := ""
 	for {
 		resp, err := s.control.ListActors(ctx, &ateapipb.ListActorsRequest{
-			PageSize:  500,
-			PageToken: pageToken,
+			Atespace: s.actorTemplateNS,
+			Options:  &ateapipb.ListOptions{PageSize: 500, PageToken: pageToken},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("ListActors: %w", err)
 		}
 		for _, a := range resp.GetActors() {
-			id := a.GetActorId()
+			if a.GetActorTemplate().GetAtespace() != s.actorTemplateNS || a.GetActorTemplate().GetName() != s.actorTemplateName {
+				continue
+			}
+			id := a.GetMetadata().GetName()
 			if pid, ok := strings.CutPrefix(id, "pw-"); ok {
 				ids = append(ids, pid)
 			}

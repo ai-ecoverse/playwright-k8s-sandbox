@@ -1,7 +1,7 @@
 // Dual-protocol Playwright sandbox server, env-driven so the same baked image
-// works for all three backends (agent-sandbox, OpenShell, substrate) and we can
+// works across the sandbox backends and we can
 // sweep gVisor-compatibility flags without rebuilding. Baked into the slim
-// image at /server.js by proxy/test/playwright-substrate.Dockerfile.
+// image at /server.js by test/playwright-substrate.Dockerfile.
 //
 // It always launches the native Playwright WebSocket server
 // (chromium.launchServer) on PORT. When MCP_PORT is set it ALSO spawns
@@ -15,7 +15,7 @@
 //                    can use any port)
 //   PW_WS_PATH       wsPath for chromium.launchServer (default '/')
 //   CHROMIUM_ARGS    comma-separated extra args, e.g.
-//                    "--no-sandbox,--disable-setuid-sandbox,--single-process"
+//                    "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage"
 //   MCP_PORT         MCP-over-HTTP listen port; when unset, MCP is not started
 //                    (single-protocol WS-only mode, e.g. substrate/gVisor)
 const path = require('path');

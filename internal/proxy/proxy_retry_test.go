@@ -133,7 +133,11 @@ func TestHandleWSRetriesOnDialFailure(t *testing.T) {
 // stale endpoint triggers one Refresh + replay against the fresh endpoint.
 func TestHandleHTTPRetriesOnDialFailure(t *testing.T) {
 	dead := deadEndpoint(t)
+	dead.TargetActor = "stale/pw-alpha"
 	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("ate-target-actor"); got != "trusted/pw-alpha" {
+			t.Errorf("retry forwarded actor %q, want trusted/pw-alpha", got)
+		}
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "ok")
 	}))
@@ -146,7 +150,7 @@ func TestHandleHTTPRetriesOnDialFailure(t *testing.T) {
 		script: map[string][]scriptedResult{
 			"abc": {
 				{ep: dead},
-				{ep: backend.Endpoint{Host: host, Port: port}},
+				{ep: backend.Endpoint{Host: host, Port: port, TargetActor: "trusted/pw-alpha"}},
 			},
 		},
 	}
@@ -171,6 +175,7 @@ func TestHandleHTTPRetriesOnDialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("ate-target-actor", "attacker/pw-victim")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

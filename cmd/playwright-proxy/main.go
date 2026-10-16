@@ -71,7 +71,7 @@ func run(log *slog.Logger) error {
 	case "sandboxclaim":
 		bk = backend.NewSandboxClaim(dyn, cfg.Namespace, cfg.TemplateName, cfg.WarmPoolName, cfg.SandboxPort, cfg.SandboxMCPPort, cfg.LabelKey)
 	case "substrate":
-		bk, err = backend.NewSubstrateWithOptions(cfg.SubstrateAPIEndpoint, cfg.SubstrateRouterAddr, cfg.SubstrateActorTemplate, cfg.SubstrateForceBoot)
+		bk, err = backend.NewSubstrateWithOptions(cfg.SubstrateAPIEndpoint, cfg.SubstrateRouterAddr, cfg.SubstrateActorTemplate, cfg.SubstrateForceBoot, cfg.SubstrateAllowedHTTPHosts...)
 		if err != nil {
 			return err
 		}

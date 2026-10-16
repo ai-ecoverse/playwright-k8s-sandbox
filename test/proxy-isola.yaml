@@ -38,11 +38,7 @@ spec:
             - { name: BACKEND,            value: "isola" }
             - { name: ISOLA_NAMESPACE,    value: "isola-sandboxes" }
             - { name: ISOLA_SANDBOX_IMAGE, value: "PLAYWRIGHT_IMAGE" }
-            # Reach the in-cluster whoami/test-target fixture: isola's default
-            # internet-egress allowance excepts private ranges, so the test's
-            # ClusterIP target needs its CIDR listed explicitly. kind's default
-            # pod/service CIDRs — adjust if your kind-config.yaml overrides them.
-            - { name: ISOLA_ALLOWED_EGRESS_CIDRS, value: "10.244.0.0/16,10.96.0.0/12" }
+            # Internal fixture egress is granted by isola-allow-test-target.yaml.
             - { name: SANDBOX_PORT,       value: "9222" }
             - { name: IDLE_TTL,           value: "10m" }
             - { name: IDLE_CHECK_INTERVAL, value: "30s" }
